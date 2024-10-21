@@ -51,6 +51,7 @@ Future<TaskStatus> binaryUpload(
     request.headers['Content-Type'] = task.mimeType;
     request.headers['Content-Disposition'] =
         'attachment; filename="${Uri.encodeComponent(task.filename)}"';
+    request.persistentConnection = false;
     // initiate the request and handle completion async
     final requestCompleter = Completer();
     var transferBytesResult = TaskStatus.failed;
