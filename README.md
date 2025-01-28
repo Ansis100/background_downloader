@@ -87,6 +87,8 @@ FileDownloader().updates.listen((update) {
       }
     });
 
+FileDownloader().start(); // activates the database and ensures proper restart after suspend/kill
+
 // Next, enqueue tasks to kick off background downloads, e.g.
 final successfullyEnqueued = await FileDownloader().enqueue(DownloadTask(
                                 url: 'https://google.com',
@@ -188,6 +190,7 @@ FileDownloader().configureNotification(
   - [Grouping tasks](#grouping-tasks)
   - [Task queues and holding queues](#task-queues-and-holding-queues)
   - [Changing WiFi requirements](#changing-wifi-requirements)
+- [Authentication and pre- and post-execution callbacks](#authentication-and-pre--and-post-execution-callbacks)
 - [Server requests](#server-requests)
 - [Cookies](#cookies)
 - [Optional parameters](#optional-parameters)
@@ -220,7 +223,7 @@ If you want to monitor progress during the download itself (e.g. for a large fil
 final result = await FileDownloader().download(task, 
     onProgress: (progress) => print('Progress update: $progress'));
 ```
-Progress updates start with 0.0 when the actual download starts (which may be in the future, e.g. if waiting for a WiFi connection), and will be sent periodically, not more than twice per second per task.  If a task completes successfully you will receive a final progress update with a `progress` value of 1.0 (`progressComplete`). Failed tasks generate `progress` of `progressFailed` (-1.0), canceled tasks `progressCanceled` (-2.0), notFound tasks `progressNotFound` (-3.0), waitingToRetry tasks `progressWaitingToRetry` (-4.0) and paused tasks `progressPaused` (-5.0).
+Progress updates start with 0.0 when the actual download starts (which may be in the future, e.g. if waiting for a WiFi connection), and will be sent periodically, not more than twice per second per task, and not less than once every 2.5 seconds.  If a task completes successfully you will receive a final progress update with a `progress` value of 1.0 (`progressComplete`). Failed tasks generate `progress` of `progressFailed` (-1.0), canceled tasks `progressCanceled` (-2.0), notFound tasks `progressNotFound` (-3.0), waitingToRetry tasks `progressWaitingToRetry` (-4.0) and paused tasks `progressPaused` (-5.0).
 
 Use `await task.expectedFileSize()` to query the server for the size of the file you are about
 to download.  The expected file size is also included in `TaskProgressUpdate`s that are sent to
@@ -315,6 +318,10 @@ print('Suggested filename=${result.task.filename}'); // note we don't use 'task'
 print('Wrong use filename=${task.filename}'); // this will print '?' as 'task' hasn't changed
 ```
 
+#### Android file URIs
+
+From Android 11 on, you can upload a file using a Storage Access Framework URI instead of the file name. To create such an `UploadTask`, use `UploadTask.fromAndroidUri` and supply the 'content://' URI. To make this easier, methods `moveToSharedStorage` and `pathInSharedStorage` can now return a URI if `asAndroidUri` is set to true. Note that if for whatever reason the URI cannot be obtained, the regular file path will be returned, so you need to confirm the returned value starts with 'content://' before using it as a URI.
+
 ### A batch of files
 
 To download a batch of files and wait for completion of all, create a `List` of `DownloadTask` objects and call `downloadBatch`:
@@ -352,8 +359,10 @@ To ensure your callbacks or listener capture events that may have happened when 
 In summary, to track your tasks persistently, follow these steps in order, immediately after app startup:
 1. If using a non-default `PersistentStorage` backend, initialize with `FileDownloader(persistentStorage: MyPersistentStorage())` and wait for the initialization to complete by calling `await FileDownloader().ready` (see [using the database](#using-the-database-to-track-tasks) for details on `PersistentStorage`).
 2. Register an event listener or callback(s) to process status and progress updates
-3. call `await FileDownloader().trackTasks()` if you want to track the tasks in a persistent database
-4. call `await FileDownloader().resumeFromBackground()` to ensure events that happened while your app was in the background are processed
+3. Call `await FileDownloader().start()` to execute the following calls in the correct order (or call these manually):
+   a. Call `await FileDownloader().trackTasks()` if you want to track the tasks in a persistent database
+   b. Call `await FileDownloader().resumeFromBackground()` to ensure events that happened while your app was in the background are processed
+   c. If you are tracking tasks in the database, after ~5 seconds, call `await FileDownloader().rescheduleKilledTasks()` to reschedule tasks that are in the database as `enqueued` or `running` yet are not enqueued or running on the native side, or that are `waitingToRetry` but not registered as such. These tasks have been "lost", most likely because the user killed your app (which kills tasks on the native side without warning)
 
 The rest of this section details [event listeners](#using-an-event-listener), [callbacks](#using-callbacks) and the [database](#using-the-database-to-track-tasks) in detail.
 
@@ -421,7 +430,7 @@ You can unregister callbacks using `FileDownloader().unregisterCallbacks()`.
 
 ### Using the database to track Tasks
 
-To keep track of the status and progress of all tasks, even after they have completed, activate tracking by calling `trackTasks()` and use the `database` field to query and retrieve the [TaskRecord](https://pub.dev/documentation/background_downloader/latest/background_downloader/TaskRecord-class.html) entries stored. For example:
+To keep track of the status and progress of all tasks, even after they have completed, activate tracking by calling `trackTasks()` (or calling `FileDownloader().start()` with `doTrackTasks` set to true - the default) and use the `database` field to query and retrieve the [TaskRecord](https://pub.dev/documentation/background_downloader/latest/background_downloader/TaskRecord-class.html) entries stored. For example:
 ```dart
 // at app startup, after registering listener or callback, start tracking
 await FileDownloader().trackTasks();
@@ -435,7 +444,7 @@ final successfullyEnqueued = await FileDownloader().enqueue(task);
 // somewhere else: query the task status by getting a `TaskRecord`
 // from the database
 final record = await FileDownloader().database.recordForId(task.taskId);
-print('Taskid ${record.taskId} with task ${record.task} has '
+print('TaskId ${record.taskId} with task ${record.task} has '
     'status ${record.status} and progress ${record.progress} '
     'with an expected file size of ${record.expectedFileSize} bytes'
 ```
@@ -443,13 +452,14 @@ print('Taskid ${record.taskId} with task ${record.task} has '
 You can interact with the `database` using `allRecords`, `allRecordsOlderThan`, `recordForId`,`deleteAllRecords`,
 `deleteRecordWithId` etc. If you only want to track tasks in a specific [group](#grouping-tasks), call `trackTasksInGroup` instead.
 
+If a user kills your app (e.g. by swiping it away in the app tray) then tasks that are running (natively) are killed, and no indication is given to your application. This cannot be avoided. To guard for this, upon app startup you can ask the downloader to reschedule killed tasks, i.e. tasks that show up as `enqueued` or `running` in the database, yet are not enqueued or running on the native side, or are `waitingToRetry` but not registered as such. Method `rescheduleKilledTasks` returns a record with two lists, 1) successfully rescheduled tasks and 2) tasks that failed to reschedule. Together, those are the missing tasks. Reschedule missing tasks a few seconds after you have called `resumeFromBackground`, as that gives the downloader time to processes updates that may have happened while the app was suspended, or call `FileDownloader().start()` with `doRescheduleKilledTasks` set to true (the default).
+
 By default, the downloader uses a modified version of the [localstore](https://pub.dev/packages/localstore) package to store the `TaskRecord` and other objects. To use a different persistent storage solution, create a class that implements the [PersistentStorage](https://pub.dev/documentation/background_downloader/latest/background_downloader/PersistentStorage-class.html) interface, and initialize the downloader by calling `FileDownloader(persistentStorage: MyPersistentStorage())` as the first use of the `FileDownloader`.
 
 As an alternative to LocalStore, use `SqlitePersistentStorage`, included in [background_downloader_sql](https://pub.dev/packages/background_downloader_sql), which supports SQLite storage and migration from Flutter Downloader.
 
-
 ## Notifications
-
+Pub
 On iOS and Android, for downloads and uploads, the downloader can generate notifications to keep the user informed of progress also when the app is in the background, and allow pause/resume and cancellation of an ongoing download from those notifications.
 
 Configure notifications by calling `FileDownloader().configureNotification` and supply a
@@ -491,7 +501,7 @@ Make sure to check for, and if necessary request, permission to display notifica
 
 If you download or upload multiple files simultaneously, you may not want a notification for every task, but one notification representing the group of tasks.  To do this, set the `groupNotificationId` field in a `notificationConfig` and use that configuration for all tasks in this group. It is easiest to combine this with the `group` field of the task, e.g.:
 ```dart
-FileDownloader.configureNotificationForGroup('bunchOfFiles', // refers to the Task.group field
+FileDownloader().configureNotificationForGroup('bunchOfFiles', // refers to the Task.group field
             running: const TaskNotification(
                 '{numFinished} out of {numTotal}', 'Progress = {progress}'),
             complete:
@@ -688,6 +698,7 @@ Uploads are very similar to downloads, except:
 There are two ways to upload a file to a server: binary upload (where the file is included in the POST body) and form/multi-part upload. Which type of upload is appropriate depends on the server you are uploading to. The upload will be done using the binary upload method only if you have set the `post` field of the `UploadTask` to 'binary'.
 
 If you already have a `File` object, you can create your `UploadTask` using `UploadTask.fromFile`, though note that this will create a task with an absolute path reference and `BaseDirectory.root`, which can cause problems on mobile platforms (see [here](#specifying-the-location-of-the-file-to-download-or-upload)). Preferably, use `Task.split` to break your `File` or filePath into appropriate baseDirectory, directory and filename and use that to create your `UploadTask`.
+On Android, you can use Storage Access Framework URIs for binary uploads by creating the task using `UploadTask.fromAndroidUri`.
 
 For multi-part uploads you can specify name/value pairs in the `fields` property of the `UploadTask` as a `Map<String, String>`. These will be uploaded as form fields along with the file. To specify multiple values for a single name, format the value as `'"value1", "value2", "value3"'` (note the double quotes and the comma to separate the values).
 
@@ -702,6 +713,8 @@ The `baseDirectory` and `directory` fields of the `MultiUploadTask` determine th
 Once the `MultiUpoadTask` is created, the fields `fileFields`, `filenames` and `mimeTypes` will contain the parsed items, and the fields `fileField`, `filename` and `mimeType` contain those lists encoded as a JSON string.
 
 Use the `MultiTaskUpload` object in the `upload` and `enqueue` methods as you would a regular `UploadTask`.
+
+For partial uploads, set the byte range by adding a "Range" header to your binary `UploadTask`, e.g. a value of "bytes=100-149" will upload 50 bytes starting at byte 100. You can omit the range end (but not the "-") to upload from the indicated start byte to the end of the file.  The "Range" header will not be passed on to the server. Note that on iOS an invalid range will cause enqueue to fail, whereas on Android and Desktop the task will fail when attempting to start.
 
 ## Parallel downloads
 
@@ -730,6 +743,7 @@ To manage or query the queue of waiting or running tasks, call:
 * `tasksFinished` to check if all tasks have finished (successfully or otherwise)
 
 Each of these methods accept a `group` parameter that targets the method to a specific group. If tasks are enqueued with a `group` other than default, calling any of these methods without a group parameter will not affect/include those tasks - only the default tasks.
+Methods `allTasks` and `allTaskId` return all tasks regardless of group if argument `allGroups` is set to `true`.
 
 **NOTE:** Only tasks that are active (ie. not in a final state) are guaranteed to be returned or counted, but returning a task does not guarantee that it is active.
 This means that if you check `tasksFinished` when processing a task update, the task you received an update for may still show as 'active', even though it just finished, and result in `false` being returned. To fix this, pass that task's taskId as `ignoreTaskId` to the `tasksFinished` call, and it will be ignored for the purpose of testing if all tasks are finished: 
@@ -818,6 +832,80 @@ By default, whether a task requires WiFi or not is determined by its `requireWiF
 When calling `FileDownloader().requireWifi`, all enqueued tasks will be canceled and rescheduled with the appropriate WiFi requirement setting, and if the `rescheduleRunningTasks` parameter is true, all running tasks will be paused (if possible, independent of the task's `allowPause` property) or canceled and resumed/restarted with the new WiFi requirement. All newly enqueued tasks will follow this setting as well.
 
 The global setting persists across application restarts. Check the current setting by calling `FileDownloader().getRequireWiFiSetting`.
+
+## Authentication and pre- and post-execution callbacks
+
+A task may be waiting a long time before it gets executed, or before it has finished, and you may need to modify the task before it actually starts (e.g. to refresh an access token) or do something when it finishes (e.g. conditionally call your server to confirm an upload has finished). The normal listener or registered callback approach does not enable that functionality, and does not execute when the app is in a suspended state.
+
+To facilitate more complex task management functions, consider using "native" callbacks:
+* `onTaskStart`: a callback called before a task starts executing. The callback receives the `Task` and returns `null` if it did not change anything, or a modified `Task` if it needs to use a different url or header. It is called after `onAuth` for token refresh, if that is set
+* `onTaskFinished`: a callback called when the task has finished. The callback receives the final `TaskStatusUpdate`.
+* `auth`: a class that facilitates management of authorization tokens and refresh tokens, and includes an `onAuth` callback similar to `onTaskStart`
+
+To add a callback to a `Task`, set its `options` property, e.g. to add an onTaskStart callback:
+```dart
+final task = DownloadTask(url: 'https://google.com',
+   options: TaskOptions(onTaskStart: myStartCallback));
+```
+where `myStartCallback` must be a top level or static function.
+
+For most situations, using the event listeners or registered "regular" callbacks is recommended, as they run in the normal application context on the main isolate. Native callbacks are called directly from native code (iOS, Android or Desktop) and therefore behave differently:
+* Native callbacks are called even when an application is suspended
+* On iOS, the callbacks runs in the main isolate
+* On Android, callbacks run in a shared background isolate, though there is no guarantee that every callback shares the same isolate as another callback
+* On Desktop, callbacks run in the same isolate as the task, and every task has its own isolate
+
+You should assume that the callback runs in an isolate, and has no access to application state or to plugins. Native callbacks are really only meant to perform simple "local" functions, operating only on the parameter passed into the callback function.
+
+### OnTaskStart
+Callback with signature`Future<Task?> Function(Task original)`, called just before the task starts executing. Your callback receives the `original` task about to start, and can modify this task if necessary. If you make modifications, you return the modified task - otherwise return null to continue execution with the original task. You can only change the task's `url` (including query parameters) and `headers` properties - making changes to any other property may lead to undefined behavior.
+
+### OnTaskFinished
+Callback with signature `Future<void> Function(TaskStatusUpdate taskStatusUpdate)`, called when the task has reached a final state (regardless of outcome). Your callback receives the final `TaskStatusUpdate` and can act on that.
+
+### Authorization
+
+The `Auth` object (which can be set as the `auth` property in `TaskOptions`) contains several properties that can optionally be set:
+* `accessToken`: the token created by your auth mechanism to provide access.  It is typically passed as part of a request in the `Authorization` header, but different mechanisms exist
+* `accessHeaders`: the headers specific to authorization. In these headers, the template `{accessToken}` will be replaced by the actual `accessToken` property, so a common value would be `{'Authorization': 'Bearer {accessToken}'`
+* `accessQueryParams`: the query parameters specific to authorization. In these headers, the template `{accessToken}` will be replaced by the actual `accessToken` property
+* `accessTokenExpiryTime`: the time at which the `accessToken` will expire.
+* `refreshToken`, `refreshHeaders` and `refreshQueryParams` are similar to those for access (the template `{refreshToken}` will be replaced with the actual `refreshToken`)
+* `refreshUrl`: url to use for refresh, including query parameters not related to the auth tokens
+* `onAuth`: callback that will be called when token refresh is required
+
+The downloader uses the `auth` object on the native side as follows:
+* Just before the task starts, we check the `accessTokenExpiryTime`
+* If it is close to this time, the downloader will call the `onAuth` callback (your code) to refresh the access token
+  - A `defaultOnAuth` function is included that calls `auth.refreshAccessToken` using a common approach, but use your own `onAuth` callback if your auth mechanism differs
+  - The `Task` returned by the `onAuth` call can change the `Auth` object itself (e.g. replace the `accessToken` with a refreshed one) and those values will be used to construct the task's request
+* The `Task` request is built as follows:
+  - Start with the headers and query parameters of the original task. You should have all headers and query parameters that are not related to authentication here
+  - Add or replace every header and query parameter from the `accessHeaders` and `accessQueryParams` to the task's headers and query parameters, substituting the templates for `accessToken` and `refreshToken`
+  - Construct the task's server request using these merged headers and query parameters
+
+A typical way to construct a task with authorization and default `onAuth` refresh approach then is:
+```dart
+final auth = Auth(
+    accessToken: 'initialAccessToken',
+    accessHeaders: {'Authorization': 'Bearer {accessToken}'},
+    refreshToken: 'initialRefreshToken',
+    refreshUrl: 'https://your.server/refresh_endpoint',
+    accessTokenExpiryTime: DateTime.now()
+            .add(const Duration(minutes: 10)), // typically extracted from token
+    onAuth: defaultOnAuth // to use typical default callback
+);
+final task = DownloadTask(
+    url: 'https://your.server/download_endpoint',
+    urlQueryParameters: {'param1': 'value1'},
+    headers: {'Header1': 'value2'},
+    filename: 'my_file.txt',
+    options: TaskOptions(auth: auth));
+```
+
+There are limitations to the auth functionality, as the original task is not updated on the Dart side. For example, if a token refresh was performed and subsequently the task is paused, the resumed task with have the original accessToken and expiry time and will therefore trigger another token refresh.
+
+__NOTE:__ The callback functionality is experimental for now, and its behavior may change without warning in future updates. Please provide feedback on callbacks.
 
 ## Server requests
 

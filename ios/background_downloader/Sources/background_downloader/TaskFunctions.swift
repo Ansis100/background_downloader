@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import Flutter
 import os.log
 
 let updatesQueue = DispatchQueue(label: "updatesProcessingQueue")
@@ -209,8 +210,9 @@ func parseRange(rangeStr: String) -> (Int64, Int64?) {
 /// the [task] headers
 func getContentLength(responseHeaders: [AnyHashable: Any], task: Task) -> Int64 {
     // On iOS, the header has already been parsed for Content-Length so we don't need to
-    // repeat that here
-    // try extracting it from Range header
+    // repeat that here (actually, we use the bytesExpectedToSend which is for some reason
+    // not always set even whe a Content-Length is set)
+    // Try extracting content length from Range header
     let taskRangeHeader = task.headers["Range"] ?? ""
     let taskRange = parseRange(rangeStr: taskRangeHeader)
     if let end = taskRange.1 {
@@ -236,14 +238,16 @@ func extractContentType(responseHeaders: [AnyHashable: Any], task: Task)  {
     let regEx = try! NSRegularExpression(pattern: #"(.*);\s*charset\s*=(.*)"#)
     let range = NSMakeRange(0, contentType.utf16.count)
     let match = regEx.firstMatch(in: contentType, options: [], range: range)
-    if let match = match {
-        let mimeType = String(contentType[Range(match.range(at: 1), in: contentType)!])
-        let charSet = String(contentType[Range(match.range(at: 2), in: contentType)!])
-        BDPlugin.mimeTypes[task.taskId] = mimeType
-        BDPlugin.charSets[task.taskId] = charSet
-    } else {
-        BDPlugin.mimeTypes[task.taskId] = contentType
-    }
+    BDPlugin.propertyLock.withLock({
+        if let match = match {
+            let mimeType = String(contentType[Range(match.range(at: 1), in: contentType)!])
+            let charSet = String(contentType[Range(match.range(at: 2), in: contentType)!])
+            BDPlugin.mimeTypes[task.taskId] = mimeType
+            BDPlugin.charSets[task.taskId] = charSet
+        } else {
+            BDPlugin.mimeTypes[task.taskId] = contentType
+        }
+    })
 }
 
 
@@ -289,10 +293,13 @@ func getHost(_ task: Task) -> String  {
 /// Calculate progress, network speed and time remaining, and send this at an appropriate
 /// interval to the Dart side
 func updateProgress(task: Task, totalBytesExpected: Int64, totalBytesDone: Int64) {
-    let info = BDPlugin.progressInfo[task.taskId] ?? (lastProgressUpdateTime: 0.0, lastProgressValue: 0.0, lastTotalBytesDone: 0, lastNetworkSpeed: -1.0)
-    if totalBytesExpected != NSURLSessionTransferSizeUnknown && Date().timeIntervalSince1970 > info.lastProgressUpdateTime + 0.5 {
+    let info = BDPlugin.propertyLock.withLock({
+        return BDPlugin.progressInfo[task.taskId] ?? (lastProgressUpdateTime: 0.0, lastProgressValue: 0.0, lastTotalBytesDone: 0, lastNetworkSpeed: -1.0)
+    })
+    let now = Date().timeIntervalSince1970
+    if totalBytesExpected != NSURLSessionTransferSizeUnknown && now > info.lastProgressUpdateTime + 0.5 {
         let progress = min(Double(totalBytesDone) / Double(totalBytesExpected), 0.999)
-        if progress - info.lastProgressValue > 0.02 {
+        if (progress - info.lastProgressValue > 0.02) || (progress > info.lastProgressValue && now > info.lastProgressUpdateTime + 2.5) {
             // calculate network speed and time remaining
             let now = Date().timeIntervalSince1970
             let timeSinceLastUpdate = now - info.lastProgressUpdateTime
@@ -301,7 +308,9 @@ func updateProgress(task: Task, totalBytesExpected: Int64, totalBytesDone: Int64
             let newNetworkSpeed = info.lastNetworkSpeed == -1.0 ? currentNetworkSpeed : (info.lastNetworkSpeed * 3.0 + currentNetworkSpeed) / 4.0
             let remainingBytes = (1.0 - progress) * Double(totalBytesExpected)
             let timeRemaining: TimeInterval = newNetworkSpeed == -1.0 ? -1.0 : (remainingBytes / newNetworkSpeed / 1000000.0)
-            BDPlugin.progressInfo[task.taskId] = (lastProgressUpdateTime: now, lastProgressValue: progress, lastTotalBytesDone: totalBytesDone, lastNetworkSpeed: newNetworkSpeed)
+            BDPlugin.propertyLock.withLock({
+                BDPlugin.progressInfo[task.taskId] = (lastProgressUpdateTime: now, lastProgressValue: progress, lastTotalBytesDone: totalBytesDone, lastNetworkSpeed: newNetworkSpeed)
+            })
             processProgressUpdate(task: task, progress: progress, expectedFileSize: totalBytesExpected, networkSpeed: newNetworkSpeed, timeRemaining: timeRemaining)
         }
     }
@@ -359,24 +368,24 @@ func processStatusUpdate(task: Task, status: TaskStatus, taskException: TaskExce
         default:
             break
     }
-    
+    // determine the TaskStatusUpdate
+    let finalResponseStatusCode = status == .complete || status == .notFound
+        ? responseStatusCode
+        : nil
+    let finalTaskException = taskException == nil
+        ? TaskException(type: .general, httpResponseCode: -1, description: "")
+        : taskException
+    let statusUpdate = isFinalState(status: status)
+        ? TaskStatusUpdate(task: task,
+                           taskStatus: status,
+                           exception: status == .failed ? finalTaskException : nil,
+                           responseBody: responseBody,
+                           responseStatusCode: (status == .complete || status == .notFound) ? finalResponseStatusCode : nil,
+                           responseHeaders: lowerCasedStringStringMap(responseHeaders),
+                           mimeType: mimeType,
+                           charSet: charSet)
+        : TaskStatusUpdate(task: task, taskStatus: status)
     if providesStatusUpdates(downloadTask: task) || retryNeeded {
-        let finalResponseStatusCode = status == .complete || status == .notFound
-            ? responseStatusCode
-            : nil
-        let finalTaskException = taskException == nil
-            ? TaskException(type: .general, httpResponseCode: -1, description: "")
-            : taskException
-        let statusUpdate = isFinalState(status: status) 
-            ? TaskStatusUpdate(task: task,
-                               taskStatus: status,
-                               exception: status == .failed ? finalTaskException : nil,
-                               responseBody: responseBody,
-                               responseStatusCode: (status == .complete || status == .notFound) ? finalResponseStatusCode : nil,
-                               responseHeaders: lowerCasedStringStringMap(responseHeaders),
-                               mimeType: mimeType,
-                               charSet: charSet)
-            : TaskStatusUpdate(task: task, taskStatus: status)
         let arg = statusUpdate.argList()
         if !postOnBackgroundChannel(method: "statusUpdate", task: task, arg: arg) {
             // store update locally as a merged task/status JSON string, without error info
@@ -399,6 +408,14 @@ func processStatusUpdate(task: Task, status: TaskStatus, taskException: TaskExce
             BDPlugin.notificationConfigJsonStrings.removeValue(forKey: task.taskId)
             BDPlugin.taskIdsThatCanResume.remove(task.taskId)
             BDPlugin.taskIdsProgrammaticallyCancelled.remove(task.taskId)
+        }
+        // invoke onTaskFinished callback if needed
+        if task.options?.hasFinishedCallback() == true {
+            _Concurrency.Task {
+                if !(await invokeOnTaskFinishedCallback(taskStatusUpdate: statusUpdate)) {
+                    os_log("Could not invoke onTaskFinishedCallback", log: log, type: .error)
+                }
+            }
         }
     }
 }
@@ -521,6 +538,16 @@ func jsonStringFor(task: Task) -> String? {
     return String(data: jsonResultData, encoding: .utf8)
 }
 
+/// Returns a JSON string for this TaskStatusUpdate, or nil
+func jsonStringFor(taskStatusUpdate: TaskStatusUpdate) -> String? {
+    let jsonEncoder = JSONEncoder()
+    guard let jsonResultData = try? jsonEncoder.encode(taskStatusUpdate)
+    else {
+        return nil
+    }
+    return String(data: jsonResultData, encoding: .utf8)
+}
+
 /// Returns a Task from the supplied jsonString, or nil
 func taskFrom(jsonString: String) -> Task? {
     let decoder = JSONDecoder()
@@ -538,7 +565,10 @@ func getTaskFrom(urlSessionTask: URLSessionTask) -> Task? {
     }
     let decoder = JSONDecoder()
     if let task = try? decoder.decode(Task.self, from: jsonData) {
-        return BDPlugin.tasksWithSuggestedFilename[task.taskId] ?? task
+        let taskWithSuggestedFilename = BDPlugin.propertyLock.withLock({
+            BDPlugin.tasksWithSuggestedFilename[task.taskId]
+        })
+        return taskWithSuggestedFilename ?? task
     }
     return nil
 }
@@ -637,7 +667,9 @@ func insufficientSpace(contentLength: Int64) -> Bool {
         return false
     }
     // Calculate the total remaining bytes to download
-    let remainingBytesToDownload = BDPlugin.remainingBytesToDownload.values.reduce(0, +)
+    let remainingBytesToDownload = BDPlugin.propertyLock.withLock( {
+        BDPlugin.remainingBytesToDownload.values.reduce(0, +)
+    })
     // Return true if there is insufficient space to store the file
     return available - (remainingBytesToDownload + contentLength) < checkValue << 20
 }

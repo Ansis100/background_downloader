@@ -2,8 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
-import 'package:background_downloader/src/permissions.dart';
-import 'package:background_downloader/src/queue/task_queue.dart';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:logging/logging.dart';
@@ -12,7 +10,9 @@ import 'base_downloader.dart';
 import 'database.dart';
 import 'localstore/localstore.dart';
 import 'models.dart';
+import 'permissions.dart';
 import 'persistent_storage.dart';
+import 'queue/task_queue.dart';
 import 'task.dart';
 import 'web_downloader.dart'
     if (dart.library.io) 'desktop/desktop_downloader.dart';
@@ -411,12 +411,16 @@ interface class FileDownloader {
   ///
   /// This method acts on a [group] of tasks. If omitted, the [defaultGroup]
   /// is used, which is the group used when you [enqueue] a task
+  /// To get all tasks regardless of group, set [allGroups] to true as the
+  /// only parameter
   Future<List<String>> allTaskIds(
           {String group = defaultGroup,
-          bool includeTasksWaitingToRetry = true}) async =>
+          bool includeTasksWaitingToRetry = true,
+          allGroups = false}) async =>
       (await allTasks(
               group: group,
-              includeTasksWaitingToRetry: includeTasksWaitingToRetry))
+              includeTasksWaitingToRetry: includeTasksWaitingToRetry,
+              allGroups: allGroups))
           .map((task) => task.taskId)
           .toList();
 
@@ -427,10 +431,13 @@ interface class FileDownloader {
   ///
   /// This method acts on a [group] of tasks. If omitted, the [defaultGroup]
   /// is used, which is the group used when you [enqueue] a task.
+  /// To get all tasks regardless of group, set [allGroups] to true as the
+  /// only parameter
   Future<List<Task>> allTasks(
           {String group = defaultGroup,
-          bool includeTasksWaitingToRetry = true}) =>
-      _downloader.allTasks(group, includeTasksWaitingToRetry);
+          bool includeTasksWaitingToRetry = true,
+          allGroups = false}) =>
+      _downloader.allTasks(group, includeTasksWaitingToRetry, allGroups);
 
   /// Returns true if tasks in this [group] are finished
   ///
@@ -480,6 +487,34 @@ interface class FileDownloader {
   /// does not guarantee that the task is still running. To keep track of
   /// the status of tasks, use a [TaskStatusCallback]
   Future<Task?> taskForId(String taskId) => _downloader.taskForId(taskId);
+
+  /// Convenience start method for using the database. Must be called AFTER
+  /// registering update callbacks or listener.
+  ///
+  /// Calls in order:
+  /// [trackTasks] to start database tracking, with [markDownloadedComplete] to
+  ///     ensure fully downloaded tasks are marked as complete in the database
+  /// [resumeFromBackground] to fetch status and progress updates that may have
+  ///     happened while the app was suspended
+  /// [rescheduleKilledTasks] (after a 5 second delay) to ensure tasks that were
+  ///     killed by the user are rescheduled
+  ///
+  /// [doTrackTasks] and [doRescheduleKilledTasks] can be set to false to skip
+  /// that step.  [resumeFromBackground] is always called.
+  Future<void> start(
+      {bool doTrackTasks = true,
+      bool markDownloadedComplete = true,
+      bool doRescheduleKilledTasks = true}) async {
+    if (doTrackTasks) {
+      await FileDownloader()
+          .trackTasks(markDownloadedComplete: markDownloadedComplete);
+      if (doRescheduleKilledTasks) {
+        Timer(const Duration(seconds: 5),
+            () => FileDownloader().rescheduleKilledTasks());
+      }
+    }
+    await FileDownloader().resumeFromBackground();
+  }
 
   /// Activate tracking for tasks in this [group]
   ///
@@ -532,6 +567,64 @@ interface class FileDownloader {
   /// Calling this method multiple times has no effect.
   Future<void> resumeFromBackground() =>
       _downloader.retrieveLocallyStoredData();
+
+  /// Reschedules tasks that are present in the database but missing from
+  /// the native task queue. Typically called on app start, 5s after establishing
+  /// the updates listener, calling [trackTasks] or [trackTasksInGroup] and
+  /// calling [resumeFromBackground].
+  ///
+  /// This function retrieves all tasks from the database that are in enqueued
+  /// or running states and compares these tasks with the
+  /// list of tasks currently present in the native task queue, and all tasks
+  /// that are in waitingToRetry state that are not actually waiting to retry
+  /// in the downloader
+  ///
+  /// For each task found only in the database (or waitingToRetry yet not
+  /// actually waiting), the function:
+  /// 1. Deletes the corresponding record from the database.
+  /// 2. Enqueues the task back into the native task queue.
+  ///
+  /// Finally, the function returns two lists of Tasks in a record. The first
+  /// item is the list of successfully re-enqueued tasks, the second item
+  /// is the list of tasks that failed to enqueue.
+  ///
+  /// Throws assertion error if you are not currently tracking tasks, as that
+  /// makes this function a no-op that always returns empty lists.
+  Future<(List<Task>, List<Task>)> rescheduleKilledTasks() async {
+    assert(
+        _downloader.isTrackingTasks,
+        'rescheduleKilledTasks should only be called if you are tracking tasks. '
+        'Did you call trackTasks or trackTasksInGroup?');
+    final missingTasks = <Task>{};
+    final databaseTasks = await database.allRecords();
+    // find missing enqueued/running tasks
+    final enqueuedOrRunningDatabaseTasks = databaseTasks
+        .where((record) => const [
+              TaskStatus.enqueued,
+              TaskStatus.running,
+            ].contains(record.status))
+        .map((record) => record.task)
+        .toSet();
+    final nativeTasks = Set<Task>.from(await FileDownloader().allTasks());
+    missingTasks.addAll(enqueuedOrRunningDatabaseTasks.difference(nativeTasks));
+    // find missing tasks waiting to retry
+    missingTasks.addAll(databaseTasks
+        .where((record) =>
+            record.status == TaskStatus.waitingToRetry &&
+            !_downloader.tasksWaitingToRetry.contains(record.task))
+        .map((record) => record.task));
+    final successfullyEnqueued = <Task>[];
+    final failedToEnqueue = <Task>[];
+    for (final task in missingTasks) {
+      await database.deleteRecordWithId(task.taskId);
+      if (await FileDownloader().enqueue(task)) {
+        successfullyEnqueued.add(task);
+      } else {
+        failedToEnqueue.add(task);
+      }
+    }
+    return (successfullyEnqueued, failedToEnqueue);
+  }
 
   /// Returns true if task can be resumed on pause
   ///
@@ -795,7 +888,10 @@ interface class FileDownloader {
   /// the [mimeType] is not provided we will attempt to derive it from the
   /// [Task.filePath] extension
   ///
-  /// Returns the path to the stored file, or null if not successful
+  /// Returns the path to the stored file, or null if not successful.
+  /// If [asAndroidUri] is true, on Android returns the URI of the stored file
+  /// instead of the filePath, if possible, otherwise falls back to the file
+  /// path.
   ///
   /// NOTE: on iOS, using [destination] [SharedStorage.images] or
   /// [SharedStorage.video] adds the photo or video file to the Photos
@@ -811,13 +907,12 @@ interface class FileDownloader {
   ///
   /// Platform-dependent, not consistent across all platforms
   Future<String?> moveToSharedStorage(
-    DownloadTask task,
-    SharedStorage destination, {
-    String directory = '',
-    String? mimeType,
-  }) async =>
+          DownloadTask task, SharedStorage destination,
+          {String directory = '',
+          String? mimeType,
+          bool asAndroidUri = false}) async =>
       moveFileToSharedStorage(await task.filePath(), destination,
-          directory: directory, mimeType: mimeType);
+          directory: directory, mimeType: mimeType, asAndroidUri: asAndroidUri);
 
   /// Move the file represented by [filePath] to a shared storage
   /// [destination] and potentially a [directory] within that destination. If
@@ -825,6 +920,10 @@ interface class FileDownloader {
   /// [filePath] extension
   ///
   /// Returns the path to the stored file, or null if not successful
+  /// If [asAndroidUri] is true, on Android returns the URI of the stored file
+  /// instead of the filePath, if possible, otherwise falls back to the file
+  /// path.
+  ///
   /// NOTE: on iOS, using [destination] [SharedStorage.images] or
   /// [SharedStorage.video] adds the photo or video file to the Photos
   /// library. This requires the user to grant permission, and requires the
@@ -839,13 +938,12 @@ interface class FileDownloader {
   ///
   /// Platform-dependent, not consistent across all platforms
   Future<String?> moveFileToSharedStorage(
-    String filePath,
-    SharedStorage destination, {
-    String directory = '',
-    String? mimeType,
-  }) async =>
+          String filePath, SharedStorage destination,
+          {String directory = '',
+          String? mimeType,
+          bool asAndroidUri = false}) async =>
       _downloader.moveToSharedStorage(
-          filePath, destination, directory, mimeType);
+          filePath, destination, directory, mimeType, asAndroidUri);
 
   /// Returns the filePath to the file represented by [filePath] in shared
   /// storage [destination] and potentially a [directory] within that
@@ -853,14 +951,18 @@ interface class FileDownloader {
   ///
   /// Returns the path to the stored file, or null if not successful
   ///
+  /// If [asAndroidUri] is true, returns the URI if possible, otherwise falls
+  /// back to the file path
+  ///
   /// See the documentation for [moveToSharedStorage] for special use case
   /// on iOS for .images and .video
   ///
   /// Platform-dependent, not consistent across all platforms
   Future<String?> pathInSharedStorage(
           String filePath, SharedStorage destination,
-          {String directory = ''}) async =>
-      _downloader.pathInSharedStorage(filePath, destination, directory);
+          {String directory = '', asAndroidUri = false}) async =>
+      _downloader.pathInSharedStorage(
+          filePath, destination, directory, asAndroidUri);
 
   /// Open the file represented by [task] or [filePath] using the application
   /// available on the platform.

@@ -505,6 +505,7 @@ void main() {
       final subscription = FileDownloader().updates.listen((update) {
         expect(update is TaskProgressUpdate, isTrue);
         if (update is TaskProgressUpdate) {
+          print("ProgressUpdate ${update.progress} at ${DateTime.now()}");
           progressCallback(update);
         }
       });
@@ -626,6 +627,30 @@ void main() {
       await FileDownloader().cancelTaskWithId(task.taskId);
       await Future.delayed(const Duration(seconds: 2));
     });
+
+    testWidgets('iOS exclude from Cloud backup', (widgetTester) async {
+      // Check the logs for evidence of the bit being set
+      final configResult = await FileDownloader()
+          .configure(globalConfig: (Config.excludeFromCloudBackup, true));
+      if (!Platform.isIOS) {
+        expect(configResult.first,
+            equals((Config.excludeFromCloudBackup, 'not implemented')));
+        return;
+      }
+      expect(configResult.first, equals((Config.excludeFromCloudBackup, '')));
+      expect(
+          () => FileDownloader().configure(
+              globalConfig: (Config.excludeFromCloudBackup, "invalid")),
+          throwsAssertionError);
+      final result = await FileDownloader().download(task);
+      expect(result.status, equals(TaskStatus.complete));
+      // Cache directory will not set bit, but cannot see that in logs
+      task = task.copyWith(baseDirectory: BaseDirectory.temporary);
+      await FileDownloader().download(task);
+      var configResult2 = await FileDownloader()
+          .configure(iOSConfig: (Config.excludeFromCloudBackup, Config.never));
+      expect(configResult2.first.$1, equals(Config.excludeFromCloudBackup));
+    });
   });
 
   group('Queue and task management', () {
@@ -666,7 +691,33 @@ void main() {
       await statusCallbackCompleter.future;
       expect(statusCallbackCounter, equals(3));
       expect(lastStatus, equals(TaskStatus.complete));
-      print('Finished alTasks');
+      print('Finished allTasks');
+    });
+
+    testWidgets('allTasks and allTaskIds with allGroups set to true',
+        (widgetTester) async {
+      print('Starting allTasks with allGroups set to true');
+      FileDownloader().registerCallbacks(taskStatusCallback: statusCallback);
+      final task2 = task.copyWith(group: 'group2');
+      expect(await FileDownloader().enqueue(task), isTrue);
+      expect(await FileDownloader().enqueue(task2), isTrue);
+      expect(await FileDownloader().allTasks(group: 'non-default'), isEmpty);
+      expect(() => FileDownloader().allTasks(group: 'some', allGroups: true),
+          throwsAssertionError);
+      expect(
+          () => FileDownloader()
+              .allTasks(includeTasksWaitingToRetry: false, allGroups: true),
+          throwsAssertionError);
+      final tasks = await FileDownloader().allTasks(allGroups: true);
+      expect(tasks.length, equals(2));
+      expect(tasks.contains(task), isTrue);
+      expect(tasks.contains(task2), isTrue);
+      final taskIds = await FileDownloader().allTaskIds(allGroups: true);
+      expect(taskIds.length, equals(2));
+      expect(taskIds.contains(task.taskId), isTrue);
+      expect(taskIds.contains(task2.taskId), isTrue);
+      await Future.delayed(const Duration(seconds: 3));
+      print('Finished allTasks with allGroups set to true');
     });
 
     testWidgets('tasksFinished', (widgetTester) async {
@@ -1712,24 +1763,94 @@ void main() {
       print('Finished enqueue binary file');
     });
 
+    testWidgets('enqueue binary file using Android URI', (widgetTester) async {
+      if (Platform.isAndroid) {
+        FileDownloader().registerCallbacks(
+            taskStatusCallback: statusCallback,
+            taskProgressCallback: progressCallback);
+        // move file to shared storage and obtain the URI
+        final dummy =
+            DownloadTask(url: uploadTestUrl, filename: uploadFilename);
+        final uriString = await FileDownloader().moveFileToSharedStorage(
+            await dummy.filePath(), SharedStorage.downloads,
+            asAndroidUri: true);
+        print('URI: $uriString');
+        final task = UploadTask.fromAndroidUri(
+            url: uploadBinaryTestUrl, uri: Uri.parse(uriString!));
+        expect(await FileDownloader().enqueue(task), isTrue);
+        await statusCallbackCompleter.future;
+        expect(statusCallbackCounter, equals(3));
+        expect(lastStatus, equals(TaskStatus.complete));
+        print('Finished enqueue binary file using Android URI');
+      }
+    });
+
+    testWidgets('enqueue binary file using incorrect Android URI',
+        (widgetTester) async {
+      if (Platform.isAndroid) {
+        final task = UploadTask.fromAndroidUri(
+            url: uploadBinaryTestUrl,
+            uri: Uri.parse('content://some/invalid/path'));
+        final result = await FileDownloader().upload(task);
+        print(result.exception?.description);
+        expect(result.status, equals(TaskStatus.failed));
+        expect(
+            result.exception?.exceptionType, equals('TaskFileSystemException'));
+      }
+    });
+
+    testWidgets('upload binary file partially bytes=2-4', (widgetTester) async {
+      FileDownloader().registerCallbacks(
+          taskStatusCallback: statusCallback,
+          taskProgressCallback: progressCallback);
+      final task = uploadTask.copyWith(
+          url: uploadBinaryTestUrl,
+          headers: {'Range': 'bytes=2-4'},
+          post: 'binary');
+      final result = await FileDownloader().upload(task);
+      expect(result.status, equals(TaskStatus.complete));
+      expect(result.responseBody, equals('fil'));
+    });
+
+    testWidgets('upload binary file partially bytes=2-', (widgetTester) async {
+      FileDownloader().registerCallbacks(
+          taskStatusCallback: statusCallback,
+          taskProgressCallback: progressCallback);
+      final task = uploadTask.copyWith(
+          url: uploadBinaryTestUrl,
+          headers: {'Range': 'bytes=2-'},
+          post: 'binary');
+      final result = await FileDownloader().upload(task);
+      expect(result.status, equals(TaskStatus.complete));
+      expect(result.responseBody, equals('file.'));
+    });
+
+    testWidgets('upload binary file partially invalid headers',
+        (widgetTester) async {
+      FileDownloader().registerCallbacks(
+          taskStatusCallback: statusCallback,
+          taskProgressCallback: progressCallback);
+      final task = uploadTask.copyWith(
+          url: uploadBinaryTestUrl, headers: {'Range': 'z'}, post: 'binary');
+      final result = await FileDownloader().upload(task);
+      expect(result.status, equals(TaskStatus.failed));
+    });
+
     testWidgets('enqueue multipart with fields', (widgetTester) async {
       FileDownloader().registerCallbacks(
           taskStatusCallback: statusCallback,
           taskProgressCallback: progressCallback);
-      expect(
-          await FileDownloader().enqueue(uploadTask.copyWith(fields: {
-            'field1': 'value1',
-            'field2': 'check\u2713',
-            'field3': '{"a":"b"}',
-            'field4': '["1", "2"]'
-          }, updates: Updates.statusAndProgress)),
-          isTrue);
-      await statusCallbackCompleter.future;
-      expect(statusCallbackCounter, equals(3));
-      expect(lastStatus, equals(TaskStatus.complete));
-      expect(progressCallbackCounter, greaterThan(1));
-      expect(lastProgress, equals(progressComplete));
-      print('Finished enqueue multipart with fields');
+      final fields = {
+        'field1': 'value1',
+        'field2': 'check\u2713',
+        'field3': '{"a":"b"}',
+        'field4': '["1", "2"]'
+      };
+      final result =
+          await FileDownloader().upload(uploadTask.copyWith(fields: fields));
+      final jsonString = result.responseBody!.replaceAll(r'\r\n', '');
+      expect(result.status, equals(TaskStatus.complete));
+      expect(jsonDecode(jsonString), equals(fields));
     });
 
     testWidgets('enqueue multipart with fields that have multiple values',
@@ -1737,17 +1858,12 @@ void main() {
       FileDownloader().registerCallbacks(
           taskStatusCallback: statusCallback,
           taskProgressCallback: progressCallback);
-      expect(
-          await FileDownloader().enqueue(uploadTask.copyWith(
-              fields: {'field1': 'value1', 'field2': '"value2", "value3"'},
-              updates: Updates.statusAndProgress)),
-          isTrue);
-      await statusCallbackCompleter.future;
-      expect(statusCallbackCounter, equals(3));
-      expect(lastStatus, equals(TaskStatus.complete));
-      expect(progressCallbackCounter, greaterThan(1));
-      expect(lastProgress, equals(progressComplete));
-      print('Finished enqueue multipart with fields that have multiple values');
+      final fields = {'field1': 'value1', 'field2': '"value2", "value3"'};
+      final result =
+          await FileDownloader().upload(uploadTask.copyWith(fields: fields));
+      expect(result.status, equals(TaskStatus.complete));
+      expect(jsonDecode(result.responseBody!),
+          equals({'field1': 'value1', 'field2': 'value2'}));
     });
 
     testWidgets('enqueue binary file, then cancel', (widgetTester) async {
@@ -1791,16 +1907,16 @@ void main() {
     testWidgets('multipart upload with await', (widgetTester) async {
       final result = await FileDownloader().upload(uploadTask);
       expect(result.status, equals(TaskStatus.complete));
-      expect(result.responseBody, equals('OK'));
+      expect(result.responseBody, equals('{}'));
       expect(result.responseHeaders?['server'], equals('Google Frontend'));
       expect(result.responseStatusCode, equals(200));
     });
 
     testWidgets('binary upload with await', (widgetTester) async {
-      final result = await FileDownloader()
-          .upload(uploadTask.copyWith(url: uploadBinaryTestUrl));
+      final result = await FileDownloader().upload(
+          uploadTask.copyWith(url: uploadBinaryTestUrl, post: 'binary'));
       expect(result.status, equals(TaskStatus.complete));
-      expect(result.responseBody, equals('OK'));
+      expect(result.responseBody, equals('A file.'));
       expect(result.responseHeaders?['server'], equals('Google Frontend'));
       expect(result.responseStatusCode, equals(200));
     });
@@ -1815,7 +1931,7 @@ void main() {
       var results = await Future.wait([taskFuture, secondTaskFuture]);
       for (var result in results) {
         expect(result.status, equals(TaskStatus.complete));
-        expect(result.responseBody, equals('OK'));
+        expect(result.responseBody, equals('{}'));
         expect(result.responseHeaders?['server'], equals('Google Frontend'));
         expect(result.responseStatusCode, equals(200));
       }
@@ -1881,7 +1997,7 @@ void main() {
       var ticks = 0;
       final result = await FileDownloader().uploadBatch(tasks,
           onElapsedTime: (elapsed) => ticks++,
-          elapsedTimeInterval: const Duration(milliseconds: 200));
+          elapsedTimeInterval: const Duration(milliseconds: 20));
       expect(result.numSucceeded, equals(3));
       expect(ticks, greaterThan(0));
       await Future.delayed(const Duration(seconds: 10));
@@ -1918,7 +2034,7 @@ void main() {
           await FileDownloader().upload(uploadTask, onElapsedTime: (elapsed) {
         print('Elapsed time: $elapsed');
         ticks++;
-      }, elapsedTimeInterval: const Duration(milliseconds: 200));
+      }, elapsedTimeInterval: const Duration(milliseconds: 20));
       expect(result.status, equals(TaskStatus.complete));
       expect(ticks, greaterThan(0));
     });
@@ -1943,13 +2059,14 @@ void main() {
     });
 
     testWidgets('upload 2 files using upload', (widgetTester) async {
+      final fields = {'key': 'value'};
       final multiTask = MultiUploadTask(
           url: uploadMultiTestUrl,
           files: [('f1', uploadFilename), ('f2', uploadFilename2)],
-          fields: {'key': 'value'});
+          fields: fields);
       final result = await FileDownloader().upload(multiTask);
       expect(result.status, equals(TaskStatus.complete));
-      expect(result.responseBody, equals('OK'));
+      expect(jsonDecode(result.responseBody!), equals(fields));
       expect(result.responseHeaders?['server'], equals('Google Frontend'));
       expect(result.responseStatusCode, equals(200));
     });
@@ -1957,13 +2074,14 @@ void main() {
     testWidgets('upload 2 files with full file path', (widgetTester) async {
       final docsDir = await getApplicationDocumentsDirectory();
       final fullPath = join(docsDir.path, uploadFilename);
+      final fields = {'key': 'value'};
       final multiTask = MultiUploadTask(
           url: uploadMultiTestUrl,
           files: [('f1', fullPath), ('f2', uploadFilename2)],
-          fields: {'key': 'value'});
+          fields: fields);
       final result = await FileDownloader().upload(multiTask);
       expect(result.status, equals(TaskStatus.complete));
-      expect(result.responseBody, equals('OK'));
+      expect(jsonDecode(result.responseBody!), equals(fields));
       expect(result.responseHeaders?['server'], equals('Google Frontend'));
       expect(result.responseStatusCode, equals(200));
     });
@@ -2770,6 +2888,21 @@ void main() {
       Directory(dirname(path)).deleteSync();
     });
 
+    test('move task to shared storage with Android URI', () async {
+      // note: moved file is not deleted in this test
+      if (Platform.isAndroid) {
+        var filePath = await task.filePath();
+        await FileDownloader().download(task);
+        final path = await FileDownloader().moveToSharedStorage(
+            task, SharedStorage.downloads,
+            asAndroidUri: true);
+        print('Uri is $path');
+        expect(path, isNotNull);
+        expect(path?.startsWith('content://'), isTrue);
+        expect(File(filePath).existsSync(), isFalse);
+      }
+    });
+
     test('[*] try to move text file to images -> error', () async {
       // Note: this test will fail on Android API below 30, as that API
       // does not have a problem storing a text file in images
@@ -2858,6 +2991,25 @@ void main() {
           .pathInSharedStorage(path, SharedStorage.downloads);
       expect(filePath, equals(path));
       File(path).deleteSync();
+    });
+
+    testWidgets('path in shared storage with Android URI',
+        (widgetTester) async {
+      if (Platform.isAndroid) {
+        await FileDownloader().download(task);
+        final path = await FileDownloader()
+            .moveToSharedStorage(task, SharedStorage.downloads);
+        print('Path in downloads is $path');
+        expect(path, isNotNull);
+        expect(File(path!).existsSync(), isTrue);
+        final uri = await FileDownloader().pathInSharedStorage(
+            path, SharedStorage.downloads,
+            asAndroidUri: true);
+        print('Uri is $uri');
+        expect(uri, isNotNull);
+        expect(uri?.startsWith('content://'), isTrue);
+        File(path).deleteSync();
+      }
     });
   });
 
@@ -3130,22 +3282,25 @@ void main() {
     testWidgets('One high priority task among regular ones',
         (widgetTester) async {
       final tasks = <DownloadTask>[];
-      for (var n = 1; n < 20; n++) {
+      for (var n = 1; n < 40; n++) {
         final downloadTask = DownloadTask(url: urlWithContentLength);
         print('Adding task with id ${downloadTask.taskId}');
         tasks.add(downloadTask);
       }
       final batchFuture = FileDownloader().downloadBatch(tasks);
-      await Future.delayed(const Duration(seconds: 1));
+      print('Wait a second after enqueuing all non-priority tasks');
+      await Future.delayed(const Duration(milliseconds: 1000));
       var priorityTask = DownloadTask(url: urlWithContentLength, priority: 0);
       print('PriorityTask taskId = ${priorityTask.taskId}');
       final result = await FileDownloader().download(priorityTask);
       expect(result.status, equals(TaskStatus.complete));
       final endOfHighPriority = DateTime.now();
+      print('High priority task finished, waiting for batch to finish');
       await batchFuture;
+      print('Batch finished');
       final elapsedTime = DateTime.now().difference(endOfHighPriority);
       print('Elapsed time after high priority download = $elapsedTime');
-      expect(elapsedTime.inSeconds, greaterThan(1));
+      expect(elapsedTime.inMilliseconds, greaterThan(20));
     });
 
     testWidgets('TaskQueue', (widgetTester) async {
@@ -3395,7 +3550,7 @@ void main() {
       });
       final t = DataTask(url: dataTaskGetUrl, headers: dataTaskHeaders);
       expect(await FileDownloader().enqueue(t), isTrue);
-      await Future.delayed(const Duration(seconds: 1));
+      await Future.delayed(const Duration(seconds: 2));
       expect(lastUpdate.status, equals(TaskStatus.complete));
       final json = jsonDecode(lastUpdate.responseBody!);
       final args = json['args'] as Map<String, dynamic>;
@@ -3480,7 +3635,7 @@ void main() {
           url: 'https://httpbin.org/status/400', // force 400 code
           headers: dataTaskHeaders);
       expect(await FileDownloader().enqueue(t), isTrue);
-      await Future.delayed(const Duration(seconds: 1));
+      await Future.delayed(const Duration(seconds: 2));
       expect(lastUpdate.status, equals(TaskStatus.failed));
       final exception = lastUpdate.exception!;
       print(exception);

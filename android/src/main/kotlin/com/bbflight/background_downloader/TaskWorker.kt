@@ -7,8 +7,10 @@ import androidx.preference.PreferenceManager
 import androidx.work.CoroutineWorker
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import com.bbflight.background_downloader.TaskWorker.Companion.TAG
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -29,8 +31,6 @@ import java.net.InetSocketAddress
 import java.net.Proxy
 import java.net.SocketException
 import java.net.URL
-import java.util.Timer
-import kotlin.concurrent.schedule
 import kotlin.concurrent.write
 import java.lang.Double.min as doubleMin
 
@@ -95,12 +95,12 @@ open class TaskWorker(
             responseStatusCode: Int? = null,
             mimeType: String? = null,
             charSet: String? = null,
-            context: Context? = null
+            context: Context
         ) {
             // Intercept status updates resulting from re-enqueue request, which
             // themselves are triggered by a change in WiFi requirement
             if (BDPlugin.tasksToReEnqueue.remove(task)) {
-                if ((status == TaskStatus.paused || status == TaskStatus.canceled || status == TaskStatus.failed) && context != null) {
+                if (status == TaskStatus.paused || status == TaskStatus.canceled || status == TaskStatus.failed) {
                     WiFi.reEnqueue(
                         EnqueueItem(
                             context,
@@ -158,32 +158,33 @@ open class TaskWorker(
                 else -> {}
             }
 
-            // Post update if task expects one, or if failed and retry is needed
-            if (canSendStatusUpdate && (task.providesStatusUpdates() || retryNeeded)) {
-                val taskStatusUpdate =
-                    if (status.isFinalState()) {  // last update gets all data
-                        TaskStatusUpdate(
-                            task = task,
-                            taskStatus = status,
-                            exception = if (status == TaskStatus.failed) taskException
-                                ?: TaskException(ExceptionType.general) else null,
-                            responseBody = responseBody,
-                            responseStatusCode = if (status == TaskStatus.complete || status == TaskStatus.notFound) responseStatusCode else null,
-                            responseHeaders = responseHeaders?.filterNotNull()
-                                ?.mapKeys { it.key.lowercase() },
-                            mimeType = mimeType,
-                            charSet = charSet
-                        )
-                    } else TaskStatusUpdate(  // interim updates are limited
+            val taskStatusUpdate =
+                if (status.isFinalState()) {  // last update gets all data
+                    TaskStatusUpdate(
                         task = task,
                         taskStatus = status,
-                        exception = null,
-                        responseBody = null,
-                        responseStatusCode = null,
-                        responseHeaders = null,
-                        mimeType = null,
-                        charSet = null
+                        exception = if (status == TaskStatus.failed) taskException
+                            ?: TaskException(ExceptionType.general) else null,
+                        responseBody = responseBody,
+                        responseStatusCode = if (status == TaskStatus.complete || status == TaskStatus.notFound) responseStatusCode else null,
+                        responseHeaders = responseHeaders?.filterNotNull()
+                            ?.mapKeys { it.key.lowercase() },
+                        mimeType = mimeType,
+                        charSet = charSet
                     )
+                } else TaskStatusUpdate(  // interim updates are limited
+                    task = task,
+                    taskStatus = status,
+                    exception = null,
+                    responseBody = null,
+                    responseStatusCode = null,
+                    responseHeaders = null,
+                    mimeType = null,
+                    charSet = null
+                )
+
+            // Post update if task expects one, or if failed and retry is needed
+            if (canSendStatusUpdate && (task.providesStatusUpdates() || retryNeeded)) {
                 val arg = taskStatusUpdate.argList
                 postOnBackgroundChannel("statusUpdate", task, arg, onFail = {
                     // unsuccessful post, so store in local prefs
@@ -197,10 +198,10 @@ open class TaskWorker(
                 })
             }
             // if task is in final state, cancel the WorkManager job (if failed),
-            // remove task from persistent storage, remove resume data from local memory
-            // and remove the task from the backgroundChannel map
+            // remove task from persistent storage, clean up references to taskId
+            // and invoke the onTaskFinishedCallback if necessary
             if (status.isFinalState()) {
-                if (context != null && status == TaskStatus.failed) {
+                if (status == TaskStatus.failed) {
                     // Cancel the WorkManager job.
                     // This is to avoid the WorkManager restarting a job that was
                     // canceled because job constraints are violated (e.g. network unavailable)
@@ -229,6 +230,9 @@ open class TaskWorker(
                     editor.apply()
                 }
                 QueueService.cleanupTaskId(task.taskId)
+                if (task.options?.hasFinishCallback() == true) {
+                    Callbacks.invokeOnTaskFinishedCallback(context, taskStatusUpdate)
+                }
             }
         }
 
@@ -393,11 +397,14 @@ open class TaskWorker(
         runInForegroundFileSize =
             prefs.getInt(BDPlugin.keyConfigForegroundFileSize, -1)
         withContext(Dispatchers.IO) {
-            Timer().schedule(taskTimeoutMillis) {
-                isTimedOut =
-                    true // triggers .failed in [TransferBytes] method if not runInForeground
+            CoroutineScope(Dispatchers.Default).launch {
+                delay(taskTimeoutMillis)
+                isTimedOut = true
             }
-            task = Json.decodeFromString(inputData.getString(keyTask)!!)
+            task = getModifiedTask(
+                context = applicationContext,
+                task = Json.decodeFromString(inputData.getString(keyTask)!!)
+            )
             notificationConfigJsonString = inputData.getString(keyNotificationConfig)
             notificationConfig =
                 if (notificationConfigJsonString != null) Json.decodeFromString(
@@ -410,7 +417,7 @@ open class TaskWorker(
                 TAG,
                 "${if (isResume) "Resuming" else "Starting"} task with taskId ${task.taskId}"
             )
-            processStatusUpdate(task, TaskStatus.running, prefs)
+            processStatusUpdate(task, TaskStatus.running, prefs, context = applicationContext)
             if (!isResume) {
                 processProgressUpdate(task, 0.0, prefs)
             }
@@ -486,7 +493,10 @@ open class TaskWorker(
                 requestMethod = task.httpRequestMethod
                 connectTimeout = requestTimeoutSeconds * 1000
                 for (header in task.headers) {
-                    setRequestProperty(header.key, header.value)
+                    // copy headers unless Range header in UploadTask
+                    if (header.key != "Range" || task.taskType != "UploadTask") {
+                        setRequestProperty(header.key, header.value)
+                    }
                 }
                 return connectAndProcess(this)
             }
@@ -528,11 +538,19 @@ open class TaskWorker(
                 )
 
                 is CancellationException -> {
-                    Log.i(
-                        TAG,
-                        "Canceled task with id ${task.taskId}: ${e.message}"
-                    )
-                    return TaskStatus.canceled
+                    if (BDPlugin.canceledTaskIds.contains(task.taskId)) {
+                        Log.i(
+                            TAG,
+                            "Canceled task with id ${task.taskId}: ${e.message}"
+                        )
+                        return TaskStatus.canceled
+                    } else {
+                        Log.i(
+                            TAG,
+                            "WorkManager CancellationException for task with id ${task.taskId} without manual cancellation: failing task"
+                        )
+                        return TaskStatus.failed
+                    }
                 }
 
                 else -> {
@@ -653,12 +671,14 @@ open class TaskWorker(
     }
 
     /**
-     * Returns true if [currentProgress] > [lastProgressUpdate] + threshold and
-     * [now] > [nextProgressUpdateTime]
+     * Returns true if [currentProgress] > [lastProgressUpdate] + 2% and
+     * [now] > [nextProgressUpdateTime], or if there was progress and
+     * [now] > [nextProgressUpdateTime] + 2 seconds
      */
     open fun shouldSendProgressUpdate(currentProgress: Double, now: Long): Boolean {
-        return currentProgress - lastProgressUpdate > 0.02 &&
-                now > nextProgressUpdateTime
+        return (currentProgress - lastProgressUpdate > 0.02 &&
+                now > nextProgressUpdateTime) || (currentProgress > lastProgressUpdate &&
+                now > nextProgressUpdateTime + 2000)
     }
 
     /**
@@ -787,4 +807,49 @@ open class TaskWorker(
 fun getTaskMap(prefs: SharedPreferences): MutableMap<String, Task> {
     val tasksMapJson = prefs.getString(BDPlugin.keyTasksMap, "{}") ?: "{}"
     return Json.decodeFromString(tasksMapJson)
+}
+
+/**
+ * Returns a [task] that may be modified through callbacks
+ *
+ * Callbacks would be attached to the task via its [Task.options] property, and if
+ * present will be invoked by starting a taskDispatcher on a background isolate, then
+ * sending the callback request via the MethodChannel
+ *
+ * First test is for auth refresh (the onAuth callback), then the onStart callback. Both
+ * callbacks run in a Dart isolate, and may return a modified task, which will be used
+ * for the actual task execution
+ */
+suspend fun getModifiedTask(context: Context, task: Task): Task {
+    var authTask: Task? = null
+    val auth = task.options?.auth
+    if (auth != null) {
+        // Refresh token if needed
+        if (auth.isTokenExpired() && auth.hasOnAuthCallback()) {
+            Log.i(TAG, "onAuth callback for taskId ${task.taskId}")
+            authTask = withContext(Dispatchers.IO) {
+                Callbacks.invokeOnAuthCallback(context, task)
+            }
+        }
+        authTask = authTask ?: task // Either original or newly authorized
+        val newAuth = authTask.options?.auth ?: return authTask
+        // Insert query parameters and headers
+        val uri = newAuth.addOrUpdateQueryParams(
+            url = authTask.url,
+            queryParams = newAuth.getExpandedAccessQueryParams()
+        )
+        val headers =
+            authTask.headers.toMutableMap().apply { putAll(newAuth.getExpandedAccessHeaders()) }
+        authTask = authTask.copyWith(url = uri.toString(), headers = headers)
+    }
+    authTask = authTask ?: task
+    if (task.options?.hasStartCallback() != true) {
+        return authTask
+    }
+    // onStart callback
+    Log.i(TAG, "onTaskStart callback for taskId ${authTask.taskId}")
+    val modifiedTask = withContext(Dispatchers.IO) {
+        Callbacks.invokeOnTaskStartCallback(context, authTask)
+    }
+    return modifiedTask ?: authTask
 }

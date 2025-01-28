@@ -1,3 +1,58 @@
+## 8.9.4
+* Modifies the interval between `TaskProgressUpdate` such that an update is sent at least once every 2.5 seconds if progress has been made, even if it less than 2% of the file size
+* Improves `rescheduleKilledTasks` to also reschedule tasks marked as `waitingToRetry` but not registered as such
+
+## 8.9.3
+* Adds `start` which ensures the various start-up calls are executed in the correct order. Use this instead of calling `trackTasks`, `resumeFromBackground` and `rescheduleKilledTasks` separately
+* Adds `rescheduleKilledTasks` which will compare enqueued/running tasks in the database with those active in the downloader, and reschedules those that have been killed by the user
+* [iOS] Removes limit on range of partial file uploads using the Range header (was 2GB)
+
+## 8.9.2
+* Upgraded minimum Dart SDK to 3.5.0 / Flutter SDK 3.24.0 to stay in sync with dependency updates
+* [Android] Fix bug when uploading files greater than 2GB, that was introduced in V8.9.0
+
+## 8.9.1
+* [iOS] Adds Privacy Manifest
+* [iOS] Adds support for Swift Package Manager and defaults the example app to using it
+
+## 8.9.0
+* Adds `options` field to Task, which take a `TaskOptions` object to configure less common task specific options - currently `onTaskStart`, `onTaskFinished` and `auth`
+  - `onTaskStart` is a callback with signature`Future<Task?> Function(Task original)`, called just before the task starts executing. Your callback receives the `original` task about to start, and can modify this task if necessary. If you make modifications, you return the modified task - otherwise return null to continue execution with the original task. You can only change the task's `url` (including query parameters) and `headers` properties - making changes to any other property may lead to undefined behavior.
+  - `onTaskFinished` is a callback with signature `Future<void> Function(TaskStatusUpdate taskStatusUpdate)`, called when the task has reached a final state (regardless of outcome). Your callback receives the final `TaskStatusUpdate` and can act on that.
+  - `auth` is an optional `Auth` object that helps manage accessToken and accessToken refresh - see the README for details
+  - __NOTE:__ The callback functionality is experimental for now, and its behavior may change without warning in future updates. Please provide feedback on callbacks
+* Upgrades Android Java version to version 17 (modifies build.gradle)
+* Fixes concurrency issue on iOS
+* Changes how `numTotal` is calculated for group notifications: `numTotal` is now increment when a task is enqueued, instead of when it starts running. Note that this can lead to a '0/20 files' type notification if the tasks are enqueued but cannot start due to a constraint such as requiring WiFi
+* Expands type of Android URI that can be used to upload a file (was MediaStore URIs only, now accepts any Android URI, e.g. one provided by a document provider such as a file picker)
+
+## 8.8.1
+
+* Fixes Android bug where timeout timer is not cleaned up after use
+
+## 8.8.0
+
+* [iOS] Adds configuration option to exclude downloaded files from iCloud backup
+* Adds `allGroups` parameter to `allTasks` and `allTaskIds` methods, to retrieve all tasks regardless of `group`
+* [Android] Fixes issue with un-commanded restart of a download in specific scenarios
+
+## 8.7.1
+
+* Fix for compilation issue on Kotlin 2
+
+## 8.7.0
+
+* Adds option to specify a file location for upload using a Mediastore URI on Android, using `UploadTask.fromUri`. A Mediastore URI can also be requested from methods `moveToSharedStorage` and `pathInSharedStorage` by adding `asAndroidUri = true` to the call.
+* Fixes bug with ParallelDownload when an error occurs
+* Updates dependency on package mime to 2.0, therefore also Dart 3.2 (Flutter 3.16.0) or greater. Use `dependency_overrides` in pubspec.yaml to resolve (background_downloader works with 1.0 and 2.0)
+
+## 8.6.0
+
+* Adds option for partial uploads, for binary uploads only. Set the byte range by adding a "Range" header to your binary `UploadTask`, e.g. a value of "bytes=100-149" will upload 50 bytes starting at byte 100. You can omit the range end (but not the "-") to upload from the indicated start byte to the end of the file.  The "Range" header will not be passed on to the server. Note that on iOS an invalid range will cause enqueue to fail, whereas on Android and Desktop the task will fail when attempting to start.
+* Fixes issue in iOS when multiple Flutter engines register the plugin
+* Fixes issue with lingering HTTP connections on desktop
+* Adds CI workflow (formatting, lints, build Android, build iOS)
+
 ## 8.5.6
 
 * Fixes desktop upload cancellation bug

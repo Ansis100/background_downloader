@@ -3,10 +3,10 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
 
-import 'package:background_downloader/src/exceptions.dart';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 
+import '../exceptions.dart';
 import '../models.dart';
 import '../task.dart';
 import 'desktop_downloader.dart';
@@ -35,19 +35,45 @@ Future<TaskStatus> binaryUpload(
     UploadTask task, String filePath, SendPort sendPort) async {
   final inFile = File(filePath);
   if (!inFile.existsSync()) {
-    logError(task, 'file to upload does not exist: $filePath');
-    taskException =
-        TaskFileSystemException('File to upload does not exist: $filePath');
+    final message = 'File to upload does not exist: $filePath';
+    logError(task, message);
+    taskException = TaskFileSystemException(message);
     return TaskStatus.failed;
   }
   final fileSize = inFile.lengthSync();
+  if (fileSize == 0) {
+    final message = 'File $filePath has 0 length';
+    logError(task, message);
+    taskException = TaskFileSystemException(message);
+    return TaskStatus.failed;
+  }
   var resultStatus = TaskStatus.failed;
   try {
+    // Extract Range header information, if present, for partial upload
+    int start = 0;
+    int end = fileSize - 1; // Default to the whole file
+    if (task.headers.containsKey('Range')) {
+      final rangeHeader = task.headers['Range']!;
+      final match = RegExp(r'bytes=(\d+)-(\d*)').firstMatch(rangeHeader);
+      if (match != null) {
+        start = int.parse(match.group(1)!);
+        if (match.group(2)!.isNotEmpty) {
+          end = int.parse(match.group(2)!);
+        }
+      } else {
+        final message = 'Invalid Range header $rangeHeader';
+        logError(task, message);
+        taskException = TaskException(message);
+        return TaskStatus.failed;
+      }
+      task.headers.remove('Range'); // not passed on to server
+    }
+    final contentLength = end - start + 1;
     final client = DesktopDownloader.httpClient;
     final request =
         http.StreamedRequest(task.httpRequestMethod, Uri.parse(task.url));
     request.headers.addAll(task.headers);
-    request.contentLength = fileSize;
+    request.contentLength = contentLength;
     request.headers['Content-Type'] = task.mimeType;
     request.headers['Content-Disposition'] =
         'attachment; filename="${Uri.encodeComponent(task.filename)}"';
@@ -75,11 +101,10 @@ Future<TaskStatus> binaryUpload(
       requestCompleter.complete();
     });
     // send the bytes to the request sink
-    final inStream = inFile.openRead();
+    final inStream = inFile.openRead(start, end + 1);
     transferBytesResult =
         await transferBytes(inStream, request.sink, fileSize, task, sendPort);
     request.sink.close(); // triggers request completion, handled above
-
     if (isCanceled) {
       // cancellation overrides other results
       resultStatus = TaskStatus.canceled;
@@ -164,6 +189,7 @@ Future<TaskStatus> multipartUpload(
       'Connection': 'Keep-Alive',
       'Cache-Control': 'no-cache'
     });
+    request.persistentConnection = false;
     // initiate the request and handle completion async
     final requestCompleter = Completer();
     var transferBytesResult = TaskStatus.failed;

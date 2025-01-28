@@ -64,6 +64,22 @@ private class UpdatesSerializer : EnumAsIntSerializer<Updates>(
 )
 
 /**
+ * Holds various options related to the task that are not included in the
+ * task's properties, as they are rare
+ */
+@Serializable
+class TaskOptions(
+    private val onTaskStartRawHandle: Long?,
+    private val onTaskFinishedRawHandle: Long?,
+    var auth: Auth?
+) {
+
+    fun hasStartCallback(): Boolean = onTaskStartRawHandle != null
+
+    fun hasFinishCallback(): Boolean = onTaskFinishedRawHandle != null
+}
+
+/**
  * The Dart side Task
  *
  * A blend of UploadTask, DownloadTask and ParallelDownloadTask with [taskType] indicating what kind
@@ -83,7 +99,7 @@ class Task(
     val fileField: String = "",
     val mimeType: String = "",
     val fields: Map<String, String> = mapOf(),
-    private val directory: String = "",
+    val directory: String = "",
     val baseDirectory: BaseDirectory,
     val group: String,
     val updates: Updates,
@@ -95,13 +111,14 @@ class Task(
     val metaData: String = "",
     val displayName: String = "",
     val creationTime: Long = System.currentTimeMillis(), // untouched, so kept as integer on Android side
+    val options: TaskOptions? = null,
     val taskType: String
 ) {
 
     /**
      * Returns a copy of the [Task] with optional changes to specific fields
      */
-    private fun copyWith(
+    fun copyWith(
         taskId: String? = null,
         url: String? = null,
         urls: List<String>? = null,
@@ -125,6 +142,7 @@ class Task(
         metaData: String? = null,
         displayName: String? = null,
         creationTime: Long? = null,
+        options: TaskOptions? = null,
         taskType: String? = null
     ): Task {
         return Task(
@@ -151,6 +169,7 @@ class Task(
             metaData = metaData ?: this.metaData,
             displayName = displayName ?: this.displayName,
             creationTime = creationTime ?: this.creationTime,
+            options = options ?: this.options,
             taskType = taskType ?: this.taskType
         )
     }
@@ -376,8 +395,6 @@ class Task(
     override fun hashCode(): Int {
         return taskId.hashCode()
     }
-
-
 }
 
 /** Defines a set of possible states which a [Task] can be in.
@@ -512,21 +529,7 @@ class TaskException(
     val type: ExceptionType,
     val httpResponseCode: Int = -1,
     val description: String = ""
-) {
-    constructor(jsonMap: Map<String, Any?>) : this(
-        type = when (jsonMap["type"] as String) {
-            "TaskFileSystemException" -> ExceptionType.fileSystem
-            "TaskUrlException" -> ExceptionType.url
-            "TaskConnectionException" -> ExceptionType.connection
-            "TaskResumeException" -> ExceptionType.resume
-            "TaskHttpException" -> ExceptionType.httpResponse
-
-            else -> ExceptionType.general
-        }, httpResponseCode = (jsonMap["httpResponseCode"] as Double? ?: -1).toInt(),
-        description = jsonMap["description"] as String? ?: ""
-    )
-}
-
+)
 
 object TaskExceptionSerializer : KSerializer<TaskException> {
     override val descriptor = buildClassSerialDescriptor("TaskException") {

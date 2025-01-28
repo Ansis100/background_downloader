@@ -12,6 +12,7 @@ import 'package:path_provider/path_provider.dart';
 
 import 'file_downloader.dart';
 import 'models.dart';
+import 'options/task_options.dart';
 import 'utils.dart';
 import 'web_downloader.dart'
     if (dart.library.io) 'desktop/desktop_downloader.dart';
@@ -126,7 +127,7 @@ base class Request {
   /// Returns the cookie header appropriate for this [request],
   /// taken from the [cookies] list.
   ///
-  /// [cookies] can be a List<Cookie> or the 'Set-Cookie' header value
+  /// [cookies] can be a `List<Cookie>` or the 'Set-Cookie' header value
   ///
   /// The returned map is the 'Cookie:' header, with the
   /// value=name; value2=name2 as the value.
@@ -251,6 +252,9 @@ sealed class Task extends Request implements Comparable {
   /// Human readable name for this task - use {displayName} in notification
   final String displayName;
 
+  /// Optional task-specific configuration using [TaskOptions]
+  final TaskOptions? options;
+
   static bool useExternalStorage = false; // for Android configuration only
 
   /// Creates a [Task]
@@ -287,6 +291,7 @@ sealed class Task extends Request implements Comparable {
   /// [metaData] user data
   /// [displayName] human readable name for this task
   /// [creationTime] time of task creation, 'now' by default.
+  /// [options] optional task-specific configuration using [TaskOptions]
   Task(
       {String? taskId,
       required super.url,
@@ -305,7 +310,8 @@ sealed class Task extends Request implements Comparable {
       this.displayName = '',
       this.allowPause = false,
       this.priority = 5,
-      super.creationTime})
+      super.creationTime,
+      this.options})
       : taskId = taskId ?? Random().nextInt(1 << 32).toString(),
         filename = filename ?? Random().nextInt(1 << 32).toString(),
         directory = _startsWithPathSeparator.hasMatch(directory)
@@ -502,6 +508,9 @@ sealed class Task extends Request implements Comparable {
         priority = (json['priority'] as num?)?.toInt() ?? 5,
         metaData = json['metaData'] ?? '',
         displayName = json['displayName'] ?? '',
+        options = json['options'] != null
+            ? TaskOptions.fromJson(json['options'])
+            : null,
         super.fromJson();
 
   /// Creates JSON map of this object
@@ -519,6 +528,7 @@ sealed class Task extends Request implements Comparable {
         'priority': priority,
         'metaData': metaData,
         'displayName': displayName,
+        'options': options?.toJson(),
         'taskType': taskType
       };
 
@@ -603,6 +613,7 @@ final class DownloadTask extends Task {
   /// [metaData] user data
   /// [displayName] human readable name for this task
   /// [creationTime] time of task creation, 'now' by default.
+  /// [options] optional task-specific configuration using [TaskOptions]
   DownloadTask(
       {super.taskId,
       required super.url,
@@ -621,7 +632,8 @@ final class DownloadTask extends Task {
       super.priority,
       super.metaData,
       super.displayName,
-      super.creationTime});
+      super.creationTime,
+      super.options});
 
   /// Creates [DownloadTask] object from [json]
   DownloadTask.fromJson(super.json)
@@ -653,7 +665,8 @@ final class DownloadTask extends Task {
           int? priority,
           String? metaData,
           String? displayName,
-          DateTime? creationTime}) =>
+          DateTime? creationTime,
+          TaskOptions? options}) =>
       DownloadTask(
           taskId: taskId ?? this.taskId,
           url: url ?? this.url,
@@ -671,7 +684,8 @@ final class DownloadTask extends Task {
           priority: priority ?? this.priority,
           metaData: metaData ?? this.metaData,
           displayName: displayName ?? this.displayName,
-          creationTime: creationTime ?? this.creationTime)
+          creationTime: creationTime ?? this.creationTime,
+          options: options ?? this.options)
         ..retriesRemaining = retriesRemaining ?? this.retriesRemaining;
 
   /// Returns a copy of the task with the [Task.filename] property changed
@@ -775,6 +789,7 @@ final class UploadTask extends Task {
   /// [metaData] user data
   /// [displayName] human readable name for this task
   /// [creationTime] time of task creation, 'now' by default.
+  /// [options] optional task-specific configuration using [TaskOptions]
   UploadTask(
       {super.taskId,
       required super.url,
@@ -795,7 +810,8 @@ final class UploadTask extends Task {
       super.priority,
       super.metaData,
       super.displayName,
-      super.creationTime})
+      super.creationTime,
+      super.options})
       : assert(filename.isNotEmpty, 'A filename is required'),
         assert(post == null || post == 'binary',
             'post field must be null, or "binary" for binary file upload'),
@@ -841,6 +857,41 @@ final class UploadTask extends Task {
             filename: p.basename(file.absolute.path),
             httpRequestMethod: httpRequestMethod ?? 'POST',
             allowPause: false);
+
+  /// Creates [UploadTask] from an Android 'content' URI, for binary upload
+  ///
+  /// The [uri] must be a 'content://' scheme and will be stored in the
+  /// [directory] property. The task's [filename] will be set to the last
+  /// path segment of the [uri].
+  ///
+  /// Note that the result of [Task.filePath] is undefined when using a URI
+  UploadTask.fromAndroidUri(
+      {required Uri uri,
+      super.taskId,
+      required super.url,
+      super.urlQueryParameters,
+      super.headers,
+      String? mimeType,
+      super.group,
+      super.updates,
+      super.requiresWiFi,
+      super.retries,
+      super.priority,
+      super.metaData,
+      super.displayName,
+      super.creationTime})
+      : mimeType = mimeType ?? 'application/octet-stream',
+        fields = {},
+        fileField = '',
+        super(
+            baseDirectory: BaseDirectory.root,
+            directory: uri.toString(),
+            filename: uri.pathSegments.last,
+            httpRequestMethod: 'POST',
+            post: 'binary',
+            allowPause: false) {
+    assert(uri.scheme == 'content', 'Android URI scheme must be "content"');
+  }
 
   /// Creates [UploadTask] object from [json]
   UploadTask.fromJson(super.json)
@@ -916,7 +967,8 @@ final class UploadTask extends Task {
           int? priority,
           String? metaData,
           String? displayName,
-          DateTime? creationTime}) =>
+          DateTime? creationTime,
+          TaskOptions? options}) =>
       UploadTask(
           taskId: taskId ?? this.taskId,
           url: url ?? this.url,
@@ -936,7 +988,8 @@ final class UploadTask extends Task {
           retries: retries ?? this.retries,
           metaData: metaData ?? this.metaData,
           displayName: displayName ?? this.displayName,
-          creationTime: creationTime ?? this.creationTime)
+          creationTime: creationTime ?? this.creationTime,
+          options: options ?? this.options)
         ..retriesRemaining = retriesRemaining ?? this.retriesRemaining;
 
   @override
@@ -1001,6 +1054,7 @@ final class MultiUploadTask extends UploadTask {
   /// [metaData] user data
   /// [displayName] human readable name for this task
   /// [creationTime] time of task creation, 'now' by default.
+  /// [options] optional task-specific configuration using [TaskOptions]
   MultiUploadTask(
       {super.taskId,
       required super.url,
@@ -1018,7 +1072,8 @@ final class MultiUploadTask extends UploadTask {
       super.retries,
       super.metaData,
       super.displayName,
-      super.creationTime})
+      super.creationTime,
+      super.options})
       : fileFields = files
             .map((e) => switch (e) {
                   String filename => p.basenameWithoutExtension(filename),
@@ -1092,7 +1147,8 @@ final class MultiUploadTask extends UploadTask {
           bool? allowPause,
           String? metaData,
           String? displayName,
-          DateTime? creationTime}) =>
+          DateTime? creationTime,
+          TaskOptions? options}) =>
       MultiUploadTask(
           taskId: taskId ?? this.taskId,
           url: url ?? this.url,
@@ -1109,7 +1165,8 @@ final class MultiUploadTask extends UploadTask {
           retries: retries ?? this.retries,
           metaData: metaData ?? this.metaData,
           displayName: displayName ?? this.displayName,
-          creationTime: creationTime ?? this.creationTime)
+          creationTime: creationTime ?? this.creationTime,
+          options: options ?? this.options)
         ..retriesRemaining = retriesRemaining ?? this.retriesRemaining;
 
   /// Zips the fileField, filename and mimeType at an index to
@@ -1159,6 +1216,7 @@ final class ParallelDownloadTask extends DownloadTask {
   /// [metaData] user data
   /// [displayName] human readable name for this task
   /// [creationTime] time of task creation, 'now' by default.
+  /// [options] optional task-specific configuration using [TaskOptions]
   ///
   /// A [ParallelDownloadTask] cannot be paused or resumed on failure
   ParallelDownloadTask(
@@ -1179,7 +1237,8 @@ final class ParallelDownloadTask extends DownloadTask {
       super.priority,
       super.metaData,
       super.displayName,
-      super.creationTime})
+      super.creationTime,
+      super.options})
       : assert(url is String || url is List<String>,
             'The `url` parameter must be a string or a list of strings'),
         assert(url is String || (url is List<String> && url.isNotEmpty),
@@ -1228,7 +1287,8 @@ final class ParallelDownloadTask extends DownloadTask {
           int? priority,
           String? metaData,
           String? displayName,
-          DateTime? creationTime}) =>
+          DateTime? creationTime,
+          TaskOptions? options}) =>
       ParallelDownloadTask(
           taskId: taskId ?? this.taskId,
           url: url ?? urls,
@@ -1246,7 +1306,8 @@ final class ParallelDownloadTask extends DownloadTask {
           priority: priority ?? this.priority,
           metaData: metaData ?? this.metaData,
           displayName: displayName ?? this.displayName,
-          creationTime: creationTime ?? this.creationTime)
+          creationTime: creationTime ?? this.creationTime,
+          options: options ?? this.options)
         ..retriesRemaining = retriesRemaining ?? this.retriesRemaining;
 }
 

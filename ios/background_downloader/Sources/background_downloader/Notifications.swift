@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import UIKit
 import os.log
 
 
@@ -282,12 +283,28 @@ private func updateGroupNotification(
 }
 
 
+/// Register that [task] was enqueued, with [success] or failure
+///
+/// This is only relevant for tasks that are part of a group notification, so that the
+/// 'numTotal' count is based on enqueued tasks, not on running tasks (which may be limited
+/// by holdingQueue or OS restrictions).
+/// [notificationConfigJsonString] is only used to detect if this task has a group notification
+func registerEnqueue(task: Task, notificationConfigJsonString: String?, success: Bool) async {
+    guard let notificationConfigJsonString = notificationConfigJsonString,
+          let notificationConfig = notificationConfigFrom(jsonString: notificationConfigJsonString),
+          !notificationConfig.groupNotificationId.isEmpty
+    else { return }
+    await updateGroupNotification(task: task, notificationType: success ? .running : .error, notificationConfig: notificationConfig)
+}
+
+
 
 /// Add action buttons to the notification
 ///
 /// Which button(s) depends on the [notificationType]. Action buttons are defined when defining the notification categories
 func addNotificationActions(task: Task, notificationType: NotificationType, content: UNMutableNotificationContent, notificationConfig: NotificationConfig) {
-    switch notificationType {
+    BDPlugin.propertyLock.withLock( {
+        switch notificationType {
         case .running:
             content.categoryIdentifier = BDPlugin.taskIdsThatCanResume.contains(task.taskId) && notificationConfig.paused != nil ? NotificationCategory.runningWithPause.rawValue : NotificationCategory.runningWithoutPause.rawValue
         case .paused:
@@ -296,7 +313,8 @@ func addNotificationActions(task: Task, notificationType: NotificationType, cont
             content.categoryIdentifier = NotificationCategory.complete.rawValue
         case .error:
             content.categoryIdentifier = NotificationCategory.error.rawValue
-    }
+        }
+    })
 }
 
 /// Add cancel action button to the notificationGroup

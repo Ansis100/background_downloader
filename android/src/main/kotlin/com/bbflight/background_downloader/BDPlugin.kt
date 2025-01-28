@@ -18,9 +18,11 @@ import androidx.work.WorkManager
 import com.bbflight.background_downloader.BDPlugin.Companion.backgroundChannel
 import com.bbflight.background_downloader.TaskWorker.Companion.processStatusUpdate
 import com.bbflight.background_downloader.TaskWorker.Companion.taskToJsonString
+import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
+import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
@@ -64,6 +66,8 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
         const val keyProgressUpdateMap = "com.bbflight.background_downloader.progressUpdateMap.v2"
         const val keyRequireWiFi =
             "com.bbflight.background_downloader.requireWifi"
+        const val keyCallbackDispatcherRawHandle =
+            "com.bbflight.background_downloader.callbackDispatcherRawHandle"
         const val keyConfigForegroundFileSize =
             "com.bbflight.background_downloader.config.foregroundFileSize"
         const val keyConfigProxyAddress = "com.bbflight.background_downloader.config.proxyAddress"
@@ -81,6 +85,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
         var notificationButtonText = mutableMapOf<String, String>() // for localization
         var firstBackgroundChannel: MethodChannel? = null
         var bgChannelByTaskId = mutableMapOf<String, MethodChannel>()
+        var flutterEngineByTaskId = mutableMapOf<String, FlutterEngine>()
         var requireWifi = RequireWiFi.asSetByTask // global setting
         val localResumeData =
             mutableMapOf<String, ResumeData>() // by taskId, for pause notifications
@@ -140,7 +145,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             val constraints = Constraints.Builder().setRequiredNetworkType(
                 if (taskRequiresWifi) NetworkType.UNMETERED else NetworkType.CONNECTED
             ).build()
-            val requestBuilder = when(task.taskType) {
+            val requestBuilder = when (task.taskType) {
                 "ParallelDownloadTask" -> OneTimeWorkRequestBuilder<ParallelDownloadTaskWorker>()
                 "DownloadTask" -> OneTimeWorkRequestBuilder<DownloadTaskWorker>()
                 "UploadTask" -> OneTimeWorkRequestBuilder<UploadTaskWorker>()
@@ -179,6 +184,14 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 )
                 return false
             }
+            // Register the enqueue with the NotificationService
+            NotificationService.registerEnqueue(
+                EnqueueItem(
+                    context = context,
+                    task = task,
+                    notificationConfigJsonString = notificationConfigJsonString
+                ), success = true
+            )
             // store Task in persistent storage, as Json representation keyed by taskId
             prefsLock.write {
                 val prefs = PreferenceManager.getDefaultSharedPreferences(context)
@@ -229,12 +242,12 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 Log.d(TAG, "Could not find tasks to cancel")
                 return false
             }
+            val prefs = PreferenceManager.getDefaultSharedPreferences(context)
+            val tasksMap = getTaskMap(prefs)
             for (workInfo in workInfos) {
                 if (workInfo.state != WorkInfo.State.SUCCEEDED) {
                     // send cancellation update for tasks that have not yet succeeded
                     // and remove associated notification
-                    val prefs = PreferenceManager.getDefaultSharedPreferences(context)
-                    val tasksMap = getTaskMap(prefs)
                     val task = tasksMap[taskId]
                     if (task != null) {
                         processStatusUpdate(
@@ -288,7 +301,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
         suspend fun cancelInactiveTask(context: Context, task: Task) {
             Log.d(TAG, "Canceling inactive task")
             val prefs = PreferenceManager.getDefaultSharedPreferences(context)
-            processStatusUpdate(task, TaskStatus.canceled, prefs)
+            processStatusUpdate(task, TaskStatus.canceled, prefs, context = context)
         }
 
         /**
@@ -321,6 +334,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
     private var backgroundChannel: MethodChannel? = null
     private lateinit var applicationContext: Context
     private var scope: CoroutineScope? = null
+    private var binaryMessenger: BinaryMessenger? = null
     var activity: Activity? = null
 
 
@@ -329,6 +343,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      */
     override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
         applicationContext = flutterPluginBinding.applicationContext
+        binaryMessenger = flutterPluginBinding.binaryMessenger
         backgroundChannel =
             MethodChannel(
                 flutterPluginBinding.binaryMessenger,
@@ -358,6 +373,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
     /**
      * Free up resources.
      *
+     * BinaryMessenger and Plugin references are set to null and removed.
      * BackgroundChannel is set to null, and references to it removed if it no longer in use anywhere
      * */
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
@@ -369,6 +385,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             firstBackgroundChannel = null
         }
         backgroundChannel = null
+        binaryMessenger = null
     }
 
     /** Processes the methodCall coming from Dart */
@@ -400,6 +417,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 "popStatusUpdates" -> methodPopStatusUpdates(result)
                 "popProgressUpdates" -> methodPopProgressUpdates(result)
                 "getTaskTimeout" -> methodGetTaskTimeout(result)
+                "registerCallbackDispatcher" -> methodRegisterCallbackDispatcher(call, result)
                 // configuration
                 "configForegroundFileSize" -> methodConfigForegroundFileSize(call, result)
                 "configProxyAddress" -> methodConfigProxyAddress(call, result)
@@ -537,10 +555,11 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
     }
 
     /**
-     * Returns a list of tasks for all tasks in progress, as a list of JSON strings
+     * Returns a list of tasks for all tasks in progress, as a list of JSON strings,
+     * optionally filtered by group
      */
     private suspend fun methodAllTasks(call: MethodCall, result: Result) {
-        val group = call.arguments as String
+        val group = call.arguments as String?
         val tasksAsListOfJsonStrings = mutableListOf<String>()
         holdingQueue?.stateMutex?.lock()
         holdingQueue?.allTasks(group)
@@ -549,7 +568,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
         val workInfos = withContext(Dispatchers.IO) {
             workManager.getWorkInfosByTag(TAG).get()
         }
-            .filter { !it.state.isFinished && it.tags.contains("group=$group") }
+            .filter { !it.state.isFinished && (group == null || it.tags.contains("group=$group")) }
         val tasksMap: MutableMap<String, Task>
         val prefs = PreferenceManager.getDefaultSharedPreferences(applicationContext)
         prefsLock.read {
@@ -715,13 +734,15 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      * - destination (Int as index into [SharedStorage] enum)
      * - directory (String): subdirectory within scoped storage
      * - mimeType (String?): mimeType of the file, overrides derived mimeType
+     * - asAndroidUri (Boolean): if set, returns the path not as a filePath but as a Uri
      */
-    private fun methodMoveToSharedStorage(call: MethodCall, result: Result) {
+    private suspend fun methodMoveToSharedStorage(call: MethodCall, result: Result) {
         val args = call.arguments as List<*>
         val filePath = args[0] as String
         val destination = SharedStorage.entries[args[1] as Int]
         val directory = args[2] as String
         val mimeType = args[3] as String?
+        val asAndroidUri = args[4] as Boolean
         // first check and potentially ask for permissions
         val status = PermissionsService.getPermissionStatus(
             applicationContext,
@@ -734,7 +755,8 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                     filePath,
                     destination,
                     directory,
-                    mimeType
+                    mimeType,
+                    asAndroidUri
                 )
             )
         } else {
@@ -746,10 +768,13 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
     /**
      * Returns path to file in Android scoped/shared storage, or null
      *
+     * If asAndroidUri is true, returns the URI if possible, otherwise falls back to file path
+     *
      * Call arguments:
      * - filePath (String): full path to file (only the name is used)
      * - destination (Int as index into [SharedStorage] enum)
      * - directory (String): subdirectory within scoped storage (ignored for Q+)
+     * - asAndroidUri (Boolean): if true, returns the URI instead of the path, if possible
      *
      * For Android Q+ uses the MediaStore, matching on filename only, i.e. ignoring
      * the directory
@@ -759,7 +784,16 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
         val filePath = args[0] as String
         val destination = SharedStorage.entries[args[1] as Int]
         val directory = args[2] as String
-        result.success(pathInSharedStorage(applicationContext, filePath, destination, directory))
+        val asAndroidUri = args[3] as Boolean
+        result.success(
+            pathInSharedStorage(
+                applicationContext,
+                filePath,
+                destination,
+                directory,
+                asAndroidUri
+            )
+        )
     }
 
     /**
@@ -829,18 +863,22 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
         val chunkTaskId = args[1] as String
         val statusOrdinal = args[2] as Int
         val exceptionJson = args[3] as String?
-        val exception = if (exceptionJson != null) {
-            TaskException(
-                Json.decodeFromString<Map<String, Any>>(exceptionJson)
+        try {
+            val exception = if (exceptionJson != null) {
+                Json.decodeFromString<TaskException>(exceptionJson)
+            } else null
+            val responseBody = args[4] as String?
+            parallelDownloadTaskWorkers[taskId]?.chunkStatusUpdate(
+                chunkTaskId,
+                TaskStatus.entries[statusOrdinal],
+                exception,
+                responseBody
             )
-        } else null
-        val responseBody = args[4] as String?
-        parallelDownloadTaskWorkers[taskId]?.chunkStatusUpdate(
-            chunkTaskId,
-            TaskStatus.entries[statusOrdinal],
-            exception,
-            responseBody
-        )
+        } catch (e: Exception) {
+            Log.w(TAG, "Exception $e")
+            Log.w(TAG, "exceptionJson = $exceptionJson")
+            e.printStackTrace()
+        }
         result.success(null)
     }
 
@@ -907,6 +945,26 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      */
     private fun methodGetTaskTimeout(result: Result) {
         result.success(TaskWorker.taskTimeoutMillis)
+    }
+
+    /**
+     * Store rawHandle for callbackDispatcher in shared preferences
+     *
+     * Dispatcher is called just before passing callback via methodChannel, to ensure
+     * that Dart is listening to the methodChannel before calling the callback.
+     */
+    private fun methodRegisterCallbackDispatcher(call: MethodCall, result: Result) {
+        PreferenceManager.getDefaultSharedPreferences(applicationContext).edit().apply {
+            val handle = call.arguments as Long?
+            if (handle != null) {
+                Log.d(TAG, "Registering callbackDispatcher handle $handle")
+                putLong(keyCallbackDispatcherRawHandle, handle)
+            } else {
+                remove(keyConfigProxyAddress)
+            }
+            apply()
+        }
+        result.success(null)
     }
 
 
@@ -1092,7 +1150,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                                     backgroundChannel?.invokeMethod(
                                         "notificationTap",
                                         listOf(taskJsonMapString, notificationTypeOrdinal),
-                                        FlutterResultHandler(resultCompleter)
+                                        FlutterBooleanResultHandler(resultCompleter)
                                     )
                                 }
                                 success = resultCompleter.await()

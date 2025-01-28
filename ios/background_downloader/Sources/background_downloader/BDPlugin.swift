@@ -22,6 +22,7 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
     public static var keyConfigProxyAdress = "com.bbflight.background_downloader.config.proxyAddress"
     public static var keyConfigProxyPort = "com.bbflight.background_downloader.config.proxyPort"
     public static var keyConfigCheckAvailableSpace = "com.bbflight.background_downloader.config.checkAvailableSpace"
+    public static var keyConfigExcludeFromCloudBackup = "com.bbflight.background_downloader.config.excludeFromCloudBackup"
     public static var keyRequireWiFi = "com.bbflight.background_downloader.requireWiFi"
     public static var forceFailPostOnBackgroundChannel = false
     
@@ -42,22 +43,31 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
     static var responseBodyData = [String: [Data]]() // list of Data objects received for this UploadTask id
     static var tasksWithSuggestedFilename = [String : Task]() // [taskId : Task with suggested filename]
     static var tasksWithContentLengthOverride = [String : Int64]() // [taskId : Content length]
+    static var tasksWithTempUploadFile = [String : URL]() // [taskId : file URL]
     static var mimeTypes = [String : String]() // [taskId : mimeType]
     static var charSets = [String : String]() // [taskId : charSet]
     static var holdingQueue: HoldingQueue? = nil
     
     static var propertyLock: NSLock = NSLock() // used to synchronize access to static properties
     
+    public static var backgroundChannel: FlutterMethodChannel? // for native <-> plugin comms
+    public static var callbackChannel: FlutterMethodChannel? // for native to trigger task callbacks
     public static var flutterPluginRegistrantCallback: FlutterPluginRegistrantCallback?
-    public static var backgroundChannel: FlutterMethodChannel?
     
     public static func register(with registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(name: "com.bbflight.background_downloader", binaryMessenger: registrar.messenger())
-        backgroundChannel = FlutterMethodChannel(name: "com.bbflight.background_downloader.background", binaryMessenger: registrar.messenger())
         registrar.addMethodCallDelegate(instance, channel: channel)
+        let callbackChannel = FlutterMethodChannel(name: "com.bbflight.background_downloader.callbacks", binaryMessenger: registrar.messenger())
         registrar.addApplicationDelegate(instance)
-        let defaults = UserDefaults.standard
-        requireWiFi = RequireWiFi(rawValue: defaults.integer(forKey: BDPlugin.keyRequireWiFi))!
+        if (backgroundChannel == nil) {
+            // This nil check fixes dead locking when used from multiple isolates
+            // by only tracking the primary isolate. This should in theory always
+            // be the Flutter main isolate.
+            // For full feature parity with Android see #382
+            backgroundChannel = FlutterMethodChannel(name: "com.bbflight.background_downloader.background", binaryMessenger: registrar.messenger())
+            BDPlugin.callbackChannel = callbackChannel
+        }
+        requireWiFi = RequireWiFi(rawValue: UserDefaults.standard.integer(forKey: BDPlugin.keyRequireWiFi))!
     }
     
     @objc
@@ -114,19 +124,21 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
                     await methodRequestPermission(call: call, result: result)
                     /// configuration
                 case "configLocalize":
-                    methodStoreConfig(key: BDPlugin.keyConfigLocalize, value: call.arguments, result: result)
+                    storeInUserDefaults(key: BDPlugin.keyConfigLocalize, value: call.arguments, result: result)
                 case "configResourceTimeout":
-                    methodStoreConfig(key: BDPlugin.keyConfigResourceTimeout, value: call.arguments, result: result)
+                    storeInUserDefaults(key: BDPlugin.keyConfigResourceTimeout, value: call.arguments, result: result)
                 case "configRequestTimeout":
-                    methodStoreConfig(key: BDPlugin.keyConfigRequestTimeout, value: call.arguments, result: result)
+                    storeInUserDefaults(key: BDPlugin.keyConfigRequestTimeout, value: call.arguments, result: result)
                 case "configProxyAddress":
-                    methodStoreConfig(key: BDPlugin.keyConfigProxyAdress, value: call.arguments, result: result)
+                    storeInUserDefaults(key: BDPlugin.keyConfigProxyAdress, value: call.arguments, result: result)
                 case "configProxyPort":
-                    methodStoreConfig(key: BDPlugin.keyConfigProxyPort, value: call.arguments, result: result)
+                    storeInUserDefaults(key: BDPlugin.keyConfigProxyPort, value: call.arguments, result: result)
                 case "configCheckAvailableSpace":
-                    methodStoreConfig(key: BDPlugin.keyConfigCheckAvailableSpace, value: call.arguments, result: result)
+                    storeInUserDefaults(key: BDPlugin.keyConfigCheckAvailableSpace, value: call.arguments, result: result)
                 case "configHoldingQueue":
                     methodConfigHoldingQueue(call: call, result: result)
+                case "configExcludeFromCloudBackup":
+                storeInUserDefaults(key: BDPlugin.keyConfigExcludeFromCloudBackup, value: call.arguments, result: result)
                 case "platformVersion":
                     result(UIDevice.current.systemVersion)
                 case "forceFailPostOnBackgroundChannel":
@@ -161,7 +173,7 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
                 postResult(result: result, value: false)
                 return
             }
-            guard let url = validateUrl(task) else
+            guard validateUrl(task) != nil else
             {
                 os_log("Invalid url: %@", log: log, type: .info, task.url)
                 postResult(result: result, value: false)
@@ -201,7 +213,10 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
         var baseRequest = URLRequest(url: url)
         baseRequest.httpMethod = task.httpRequestMethod
         for (key, value) in task.headers {
-            baseRequest.setValue(value, forHTTPHeaderField: key)
+            // copy headers unless Range header in UploadTask
+            if key != "Range" || task.taskType != "UploadTask" {
+                baseRequest.setValue(value, forHTTPHeaderField: key)
+            }
         }
         let requiresWiFi = taskRequiresWiFi(task: task)
         if requiresWiFi {
@@ -216,31 +231,16 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
             return await scheduleParallelDownload(task: task, taskDescription: taskDescription, baseRequest: baseRequest, resumeData: resumeDataAsBase64String)
         } else if isDownloadTask(task: task) || isDataTask(task: task)
         {
-            return scheduleDownload(task: task, taskDescription: taskDescription, baseRequest: baseRequest, resumeData: resumeData)
+            return await scheduleDownload(task: task, taskDescription: taskDescription, baseRequest: baseRequest, resumeData: resumeData, notificationConfigJsonString: notificationConfigJsonString)
         } else
         {
-            return scheduleUpload(task: task, taskDescription: taskDescription, baseRequest: baseRequest)
+            return await scheduleUpload(task: task, taskDescription: taskDescription, baseRequest: baseRequest, notificationConfigJsonString: notificationConfigJsonString)
         }
     }
-    
-    /// Returns the task's URL if it can be parsed, otherwise null
-    private func validateUrl(_ task: Task) -> URL? {
-        let url: URL?
-        // encodingInvalidCharacters is only available when compiling with Xcode 15, which uses Swift version 5.9
-        #if swift(>=5.9)
-        if #available(iOS 17.0, *) {
-            url = URL(string: task.url, encodingInvalidCharacters: false)
-        } else {
-            url = URL(string: task.url)
-        }
-        #else
-        url = URL(string: task.url)
-        #endif
-        return url
-    }
+
     
     /// Schedule a download task
-    private func scheduleDownload(task: Task, taskDescription: String, baseRequest: URLRequest, resumeData: Data?) -> Bool {
+    private func scheduleDownload(task: Task, taskDescription: String, baseRequest: URLRequest, resumeData: Data?, notificationConfigJsonString: String?) async -> Bool {
         var request = baseRequest
         if task.post != nil {
             request.httpBody = Data((task.post ?? "").data(using: .utf8)!)
@@ -249,34 +249,81 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
         urlSessionDownloadTask.taskDescription = taskDescription
         urlSessionDownloadTask.priority = 1 - Float(task.priority) / 10
         urlSessionDownloadTask.resume()
-        postEnqueuedStatusIfNotAlreadyDone(task: task)
+        await postEnqueuedStatusIfNotAlreadyDone(task: task, notificationConfigJsonString: notificationConfigJsonString)
         return true
     }
     
     /// Schedule an upload task
-    private func scheduleUpload(task: Task, taskDescription: String, baseRequest: URLRequest) -> Bool {
+    private func scheduleUpload(task: Task, taskDescription: String, baseRequest: URLRequest, notificationConfigJsonString: String?) async -> Bool  {
         var request = baseRequest
         if isBinaryUploadTask(task: task) {
+            // binary post can use uploadTask fromFile method
             os_log("Binary file upload", log: log, type: .debug)
             guard let directory = try? directoryForTask(task: task) else {
                 os_log("Could not find directory for taskId %@", log: log, type: .info, task.taskId)
                 return false
             }
-            let filePath = directory.appendingPath(task.filename)
-            if !FileManager.default.fileExists(atPath: filePath.path) {
-                os_log("Could not find file %@ for taskId %@", log: log, type: .info, filePath.absoluteString, task.taskId)
+            let fileUrl = directory.appendingPath(task.filename)
+            if !FileManager.default.fileExists(atPath: fileUrl.path) {
+                os_log("Could not find file %@ for taskId %@", log: log, type: .info, fileUrl.absoluteString, task.taskId)
                 return false
             }
-            // binary post can use uploadTask fromFile method
             request.setValue(task.mimeType, forHTTPHeaderField: "Content-Type")
             if let encodedFilename = task.filename.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) {
                 request.setValue("attachment; filename=\"\(encodedFilename)\"", forHTTPHeaderField: "Content-Disposition")
             } else {
-                os_log("Could not encode task.fileName %@", log: log, type: .debug, task.filename)
+                os_log("Could not encode task.fileName %@", log: log, type: .info, task.filename)
                 return false
             }
             request.setValue("attachment; filename=\"\(task.filename)\"", forHTTPHeaderField: "Content-Disposition")
-            let urlSessionUploadTask = UrlSessionDelegate.urlSession!.uploadTask(with: request, fromFile: filePath)
+            var uploadFileUrl = fileUrl // if no range given
+            if let rangeHeader = task.headers["Range"] {
+                // determine the start and content length from the range header
+                let regex = try? NSRegularExpression(pattern: #"bytes=(\d+)-(\d*)"#)
+                let range = NSRange(rangeHeader.startIndex..<rangeHeader.endIndex, in: rangeHeader)
+                if let match = regex?.firstMatch(in: rangeHeader, options: [], range: range) {
+                    if let startRange = Range(match.range(at: 1), in: rangeHeader),
+                       let start = UInt64(rangeHeader[startRange]) {
+                        let contentLength: UInt64
+                        if let endRange = Range(match.range(at: 2), in: rangeHeader),
+                           let end = UInt64(rangeHeader[endRange]) {
+                            contentLength = end - start + 1
+                        } else {
+                            // get file size to determine contentLength
+                            do {
+                                let attributes = try FileManager.default.attributesOfItem(atPath: fileUrl.path)
+                                if let fileSize = attributes[.size] as? UInt64 {
+                                    contentLength = fileSize - start
+                                } else {
+                                    os_log("Could not get file size", log: log, type: .info)
+                                    return false
+                                }
+                            } catch {
+                                os_log("Could not get file size", log: log, type: .info)
+                                return false
+                            }
+                        }
+                        // create the partial file for upload
+                        if let tempFileUrl = createTempFileWithRange(from: fileUrl, start: start, contentLength: contentLength) {
+                            BDPlugin.propertyLock.withLock({
+                                BDPlugin.tasksWithTempUploadFile[task.taskId] = tempFileUrl
+                            })
+                            uploadFileUrl = tempFileUrl
+                        }
+                        else {
+                            os_log("Could not create temp file for partial upload", log: log, type: .info)
+                            return false
+                        }
+                    } else {
+                        os_log("Invalid Range header %@", log: log, type: .info, rangeHeader)
+                        return false
+                    }
+                } else {
+                    os_log("Invalid Range header %@", log: log, type: .info, rangeHeader)
+                    return false
+                }
+            }
+            let urlSessionUploadTask = UrlSessionDelegate.urlSession!.uploadTask(with: request, fromFile: uploadFileUrl)
             urlSessionUploadTask.taskDescription = taskDescription
             urlSessionUploadTask.priority = 1 - Float(task.priority) / 10
             urlSessionUploadTask.resume()
@@ -298,15 +345,17 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
             BDPlugin.uploaderForUrlSessionTaskIdentifier[urlSessionUploadTask.taskIdentifier] = uploader
             urlSessionUploadTask.resume()
         }
-        postEnqueuedStatusIfNotAlreadyDone(task: task)
+        await postEnqueuedStatusIfNotAlreadyDone(task: task, notificationConfigJsonString: notificationConfigJsonString)
         return true
     }
     
     /// Post [TaskStatus.enqueued] only if this was not already done when adding the task to the [holdingQueue]
-    func postEnqueuedStatusIfNotAlreadyDone(task: Task) {
+    func postEnqueuedStatusIfNotAlreadyDone(task: Task, notificationConfigJsonString: String?) async {
         if BDPlugin.holdingQueue?.enqueuedTaskIds.contains(task.taskId) != true {
             processStatusUpdate(task: task, status: TaskStatus.enqueued)
         }
+        // register the enqueue with the notification service (for accurate groupnotification count)
+        await registerEnqueue(task: task, notificationConfigJsonString: notificationConfigJsonString, success: true)
     }
     
     /// Resets the downloadworker by cancelling all ongoing download tasks
@@ -324,9 +373,9 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
         result(counter)
     }
     
-    /// Returns a list with all tasks in progress, as a list of JSON strings
+    /// Returns a list with all tasks in progress, as a list of JSON strings, optionally filtered by [group]
     private func methodAllTasks(call: FlutterMethodCall, result: @escaping FlutterResult) async {
-        let group = call.arguments as! String
+        let group = call.arguments as? String
         var tasksAsListOfJsonStrings = [String]()
         await BDPlugin.holdingQueue?.stateLock.lock()
         if let heldTasksJsonStrings = BDPlugin.holdingQueue?.allTasks(group: group).map({jsonStringFor(task: $0)}).filter({$0 != nil}).map({$0!}) {
@@ -334,7 +383,7 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
         }
         UrlSessionDelegate.createUrlSession()
         if let urlSessionTasks = await UrlSessionDelegate.urlSession?.allTasks {
-            tasksAsListOfJsonStrings.append(contentsOf: urlSessionTasks.filter({ $0.state == .running || $0.state == .suspended }).map({ getTaskFrom(urlSessionTask: $0)}).filter({ $0?.group == group }).map({ jsonStringFor(task: $0!) }).filter({ $0 != nil }).map({$0!}))
+            tasksAsListOfJsonStrings.append(contentsOf: urlSessionTasks.filter({ $0.state == .running || $0.state == .suspended }).map({ getTaskFrom(urlSessionTask: $0)}).filter({group == nil || $0?.group == group }).map({ jsonStringFor(task: $0!) }).filter({ $0 != nil }).map({$0!}))
         }
         await BDPlugin.holdingQueue?.stateLock.unlock()
         os_log("Returning %d unfinished tasks", log: log, type: .debug, tasksAsListOfJsonStrings.count)
@@ -382,13 +431,17 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
     private func methodPause(call: FlutterMethodCall, result: @escaping FlutterResult) async {
         let taskId = call.arguments as! String
         UrlSessionDelegate.createUrlSession()
-        BDPlugin.taskIdsProgrammaticallyCancelled.insert(taskId)
+        BDPlugin.propertyLock.withLock({
+            _ = BDPlugin.taskIdsProgrammaticallyCancelled.insert(taskId)
+        })
         guard let urlSessionTask = await UrlSessionDelegate.getUrlSessionTaskWithId(taskId: taskId) as? URLSessionDownloadTask,
               let task = await UrlSessionDelegate.getTaskWithId(taskId: taskId),
               let resumeData = await urlSessionTask.cancelByProducingResumeData()
         else {
             // no regular task found, return if there's no ParalleldownloadTask either
-            BDPlugin.taskIdsProgrammaticallyCancelled.remove(taskId)
+            BDPlugin.propertyLock.withLock({
+                _ = BDPlugin.taskIdsProgrammaticallyCancelled.remove(taskId)
+            })
             if ParallelDownloader.downloads[taskId] == nil {
                 os_log("Could not pause task %@", log: log, type: .info, taskId)
                 result(false)
@@ -474,7 +527,7 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
         result(jsonString)
         return
     }
-    
+
     /// Moves a file represented by the first argument to a SharedStorage destination
     ///
     /// Results in the new filePath if successful, or nil
@@ -619,7 +672,7 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
     /// Store or remove a configuration in shared preferences
     ///
     /// If the value is nil, the configuration is removed
-    private func methodStoreConfig(key: String, value: Any?, result: @escaping FlutterResult) {
+    private func storeInUserDefaults(key: String, value: Any?, result: @escaping FlutterResult) {
         let defaults = UserDefaults.standard
         if value != nil {
             defaults.set(value, forKey: key)
@@ -638,8 +691,7 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
         BDPlugin.holdingQueue?.maxConcurrentByGroup = args[2] as! Int
         result(nil)
     }
-    
-    
+
     /// Sets or resets flag to force failing posting on background channel
     ///
     /// For testing only
@@ -663,6 +715,22 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
         result(resultTask.filename)
     }
     
+    //MARK: UIApplicationDelegate
+    
+    /// When the app restarts, recreate the urlSession if needed, and store the completion handler
+    public func application(_ application: UIApplication,
+                            handleEventsForBackgroundURLSession identifier: String,
+                            completionHandler: @escaping () -> Void) -> Bool {
+        if (identifier == UrlSessionDelegate.sessionIdentifier) {
+            os_log("Application asked to handleEventsForBackgroundURLSession", log: log, type: .info)
+            UrlSessionDelegate.backgroundCompletionHandler = completionHandler
+            UrlSessionDelegate.createUrlSession()
+            return true
+        }
+        return false
+    }
+    
+
     //MARK: UNUserNotificationCenterDelegate
     
     @MainActor

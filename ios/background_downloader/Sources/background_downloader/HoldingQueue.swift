@@ -45,6 +45,9 @@ class HoldingQueue {
         queue.append(item)
         queue.sort()
         enqueuedTaskIds.append(item.task.taskId)
+        await registerEnqueue(task: item.task,
+                              notificationConfigJsonString: item.notificationConfigJsonString,
+                              success: true) // for accurate groupnotification count
         advanceQueue()
         await stateLock.unlock()
     }
@@ -118,13 +121,13 @@ class HoldingQueue {
     }
     
     /**
-     * Return list of [Task] for this [group]
+     * Return list of [Task] for this [group]. If [group] is nil al tasks are returned
      *
      * Because this is used in combination with the UrlSessions tasks, use of this method
      * requires the caller to acquire the [stateLock]
      */
-    func allTasks(group: String) -> [Task] {
-        return queue.filter( { $0.task.group == group } ).map { $0.task }
+    func allTasks(group: String?) -> [Task] {
+        return queue.filter( { group == nil || $0.task.group == group } ).map { $0.task }
     }
     
     /**
@@ -235,6 +238,8 @@ struct EnqueueItem : Comparable {
             os_log("Delayed or retried enqueue failed for taskId %@", log: log, type: .info, task.taskId)
             processStatusUpdate(task: task, status: .failed, taskException: TaskException(type: .general, description: "Delayed or retried enqueue failed"))
             await BDPlugin.holdingQueue?.taskFinished(task, reEntry: true)
+            // register the failure with the notification service (for accurate groupnotification count)
+            await registerEnqueue(task: task, notificationConfigJsonString: notificationConfigJsonString, success: false)
         }
     }
 }

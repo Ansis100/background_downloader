@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ui';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -23,6 +24,8 @@ abstract base class NativeDownloader extends BaseDownloader {
   static const _backgroundChannel =
       MethodChannel('com.bbflight.background_downloader.background');
 
+  /// Initializes the background channel and starts listening for messages from
+  /// the native side
   @override
   Future<void> initialize() async {
     await super.initialize();
@@ -243,12 +246,12 @@ abstract base class NativeDownloader extends BaseDownloader {
 
   @override
   Future<List<Task>> allTasks(
-      String group, bool includeTasksWaitingToRetry) async {
+      String group, bool includeTasksWaitingToRetry, allGroups) async {
     final retryAndPausedTasks =
-        await super.allTasks(group, includeTasksWaitingToRetry);
-    final result =
-        await methodChannel.invokeMethod<List<dynamic>?>('allTasks', group) ??
-            [];
+        await super.allTasks(group, includeTasksWaitingToRetry, allGroups);
+    final result = await methodChannel.invokeMethod<List<dynamic>?>(
+            'allTasks', allGroups ? null : group) ??
+        [];
     final tasks = result
         .map((e) => Task.createFromJson(jsonDecode(e as String)))
         .toList();
@@ -355,16 +358,20 @@ abstract base class NativeDownloader extends BaseDownloader {
   }
 
   @override
-  Future<String?> moveToSharedStorage(String filePath,
-          SharedStorage destination, String directory, String? mimeType) =>
+  Future<String?> moveToSharedStorage(
+          String filePath,
+          SharedStorage destination,
+          String directory,
+          String? mimeType,
+          bool asAndroidUri) =>
       methodChannel.invokeMethod<String?>('moveToSharedStorage',
-          [filePath, destination.index, directory, mimeType]);
+          [filePath, destination.index, directory, mimeType, asAndroidUri]);
 
   @override
-  Future<String?> pathInSharedStorage(
-          String filePath, SharedStorage destination, String directory) =>
-      methodChannel.invokeMethod<String?>(
-          'pathInSharedStorage', [filePath, destination.index, directory]);
+  Future<String?> pathInSharedStorage(String filePath,
+          SharedStorage destination, String directory, bool asAndroidUri) =>
+      methodChannel.invokeMethod<String?>('pathInSharedStorage',
+          [filePath, destination.index, directory, asAndroidUri]);
 
   @override
   Future<bool> openFile(Task? task, String? filePath, String? mimeType) async {
@@ -457,12 +464,38 @@ abstract base class NativeDownloader extends BaseDownloader {
 /// Android native downloader
 final class AndroidDownloader extends NativeDownloader {
   static final AndroidDownloader _singleton = AndroidDownloader._internal();
+  static int? _callbackDispatcherRawHandle;
 
   factory AndroidDownloader() {
     return _singleton;
   }
 
   AndroidDownloader._internal();
+
+  @override
+  Future<bool> enqueue(Task task) async {
+    // on Android, need to register [_callbackDispatcherRawHandle] upon first
+    // encounter of a task with callbacks
+    if (task.options?.hasCallback == true &&
+        _callbackDispatcherRawHandle == null) {
+      final rawHandle =
+          PluginUtilities.getCallbackHandle(initCallbackDispatcher)
+              ?.toRawHandle();
+      if (rawHandle != null) {
+        final success = await NativeDownloader.methodChannel
+            .invokeMethod<bool>('registerCallbackDispatcher', rawHandle);
+        if (success == true) {
+          _callbackDispatcherRawHandle = rawHandle;
+          log.fine('Registered callbackDispatcher with handle $rawHandle');
+        } else {
+          log.warning('Could not register callbackDispatcher');
+        }
+      } else {
+        log.warning('Could not obtain rawHandle for initCallbackDispatcher');
+      }
+    }
+    return super.enqueue(task);
+  }
 
   @override
   dynamic platformConfig(
@@ -555,6 +588,17 @@ final class IOSDownloader extends NativeDownloader {
 
   IOSDownloader._internal();
 
+  /// On iOS we immediately initialize the callback dispatcher and start
+  /// listening for callback messages from the native side
+  ///
+  /// Whereas on Android, the initialization is done directly by the native side
+  /// using a DartExecutor
+  @override
+  Future<void> initialize() async {
+    initCallbackDispatcher();
+    return super.initialize();
+  }
+
   @override
   dynamic platformConfig(
           {dynamic globalConfig,
@@ -578,6 +622,19 @@ final class IOSDownloader extends NativeDownloader {
         await NativeDownloader.methodChannel
             .invokeMethod('configLocalize', translation);
 
+      case (Config.excludeFromCloudBackup, dynamic exclude):
+        assert(
+            exclude is bool || [Config.always, Config.never].contains(exclude),
+            '${Config.excludeFromCloudBackup} expects one of ${[
+              'true',
+              'false',
+              Config.never,
+              Config.always
+            ]}');
+        final boolValue = (exclude == true || exclude == Config.always);
+        await NativeDownloader.methodChannel
+            .invokeMethod('configExcludeFromCloudBackup', boolValue);
+
       default:
         return (
           configItem.$1,
@@ -586,4 +643,43 @@ final class IOSDownloader extends NativeDownloader {
     }
     return (configItem.$1, ''); // normal result
   }
+}
+
+const _callbackChannel =
+    MethodChannel('com.bbflight.background_downloader.callbacks');
+
+/// Initialize the callbackDispatcher for task related callbacks (hooks)
+///
+/// Establishes the methodChannel through which the native side will send its
+/// callBacks, and teh listener that processes the different callback types.
+///
+/// This method is called directly from the native platform prior to using
+/// the [_callbackChannel] to post the actual callback
+@pragma('vm:entry-point')
+void initCallbackDispatcher() {
+  WidgetsFlutterBinding.ensureInitialized();
+  _callbackChannel.setMethodCallHandler((MethodCall call) async {
+    switch (call.method) {
+      case 'onTaskStartCallback':
+      case 'onAuthCallback':
+        final taskJsonString = call.arguments as String;
+        final task = Task.createFromJson(jsonDecode(taskJsonString));
+        final callBack = call.method == 'onTaskStartCallback'
+            ? task.options?.onTaskStartCallBack
+            : task.options?.auth?.onAuthCallback;
+        final newTask = await callBack?.call(task);
+        if (newTask == null) {
+          return null;
+        }
+        return jsonEncode(newTask.toJson());
+
+      case 'onTaskFinishedCallback':
+        final taskUpdateJsonString = call.arguments as String;
+        final taskStatusUpdate =
+            TaskStatusUpdate.fromJsonString(taskUpdateJsonString);
+        final callBack = taskStatusUpdate.task.options?.onTaskFinishedCallBack;
+        await callBack?.call(taskStatusUpdate);
+        return null;
+    }
+  });
 }

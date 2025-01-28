@@ -5,12 +5,12 @@ import 'dart:isolate';
 import 'dart:math';
 
 import 'package:async/async.dart';
-import 'package:background_downloader/src/exceptions.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:logging/logging.dart';
 
+import '../exceptions.dart';
 import '../models.dart';
 import '../task.dart';
 import 'data_isolate.dart';
@@ -57,7 +57,7 @@ Future<void> doTask((RootIsolateToken, SendPort) isolateArguments) async {
   final messagesToIsolate = StreamQueue<dynamic>(receivePort);
   // get the arguments list and parse each argument
   final (
-    Task task,
+    Task originalTask,
     String filePath,
     ResumeData? resumeData,
     bool isResume,
@@ -73,6 +73,7 @@ Future<void> doTask((RootIsolateToken, SendPort) isolateArguments) async {
       sendPort.send(('log', (rec.message)));
     }
   });
+  final task = await getModifiedTask(originalTask);
   // start listener/processor for incoming messages
   unawaited(listenToIncomingMessages(task, messagesToIsolate, sendPort));
   processStatusUpdateInIsolate(task, TaskStatus.running, sendPort);
@@ -80,8 +81,9 @@ Future<void> doTask((RootIsolateToken, SendPort) isolateArguments) async {
     processProgressUpdateInIsolate(task, 0.0, sendPort);
   }
   if (task.retriesRemaining < 0) {
-    logError(task, 'task has negative retries remaining');
-    taskException = TaskException('Task has negative retries remaining');
+    const message = 'Task has negative retries remaining';
+    logError(task, message);
+    taskException = TaskException(message);
     processStatusUpdateInIsolate(task, TaskStatus.failed, sendPort);
   } else {
     // allow immediate cancel message to come through
@@ -100,6 +102,7 @@ Future<void> doTask((RootIsolateToken, SendPort) isolateArguments) async {
       DataTask() => doDataTask(task, sendPort)
     };
   }
+  DesktopDownloader.httpClient.close();
   receivePort.close();
   sendPort.send('done'); // signals end
   Isolate.exit();
@@ -231,24 +234,33 @@ void processStatusUpdateInIsolate(
     default:
       {}
   }
-// Post update if task expects one, or if failed and retry is needed
+  final statusUpdate = TaskStatusUpdate(
+    task,
+    status,
+    status == TaskStatus.failed ? taskException ?? TaskException('None') : null,
+    status.isFinalState ? responseBody : null,
+    status.isFinalState ? responseHeaders : null,
+    status == TaskStatus.complete || status == TaskStatus.notFound
+        ? responseStatusCode
+        : null,
+    status.isFinalState ? mimeType : null,
+    status.isFinalState ? charSet : null,
+  );
+  // Post update if task expects one, or if failed and retry is needed
   if (task.providesStatusUpdates || retryNeeded) {
     sendPort.send((
       'statusUpdate',
-      task,
-      status,
-      status == TaskStatus.failed
-          ? taskException ?? TaskException('None')
-          : null,
-      status.isFinalState ? responseBody : null,
-      status.isFinalState ? responseHeaders : null,
-      status == TaskStatus.complete || status == TaskStatus.notFound
-          ? responseStatusCode
-          : null,
-      status.isFinalState ? mimeType : null,
-      status.isFinalState ? charSet : null,
+      statusUpdate.task,
+      statusUpdate.status,
+      statusUpdate.exception,
+      statusUpdate.responseBody,
+      statusUpdate.responseHeaders,
+      statusUpdate.responseStatusCode,
+      statusUpdate.mimeType,
+      statusUpdate.charSet,
     ));
   }
+  task.options?.onTaskFinishedCallBack?.call(statusUpdate);
 }
 
 /// Processes a progress update for the [task]
@@ -301,6 +313,37 @@ void processProgressUpdateInIsolate(
       ));
     }
   }
+}
+
+/// Returns a [task] that may be modified through callbacks
+///
+/// Callbacks would be attached to the task via its [Task.options] property, and if
+/// present will be invoked by starting a taskDispatcher on a background isolate, then
+/// sending the callback request via the MethodChannel
+Future<Task> getModifiedTask(Task task) async {
+  Task? authTask;
+  final auth = task.options?.auth;
+  if (auth != null) {
+    // refresh token if needed
+    if (auth.isTokenExpired() && auth.onAuthCallback != null) {
+      authTask = await auth.onAuthCallback?.call(task);
+    }
+    authTask ??= task; // either original or newly authorized
+    final newAuth = authTask.options?.auth;
+    if (newAuth == null) {
+      // no auth object on authorized task
+      return authTask;
+    }
+    // insert query parameters and headers
+    final uri = newAuth.addOrUpdateQueryParams(
+        url: authTask.url, queryParams: newAuth.getAccessQueryParams());
+    final headers = {...authTask.headers, ...newAuth.getAccessHeaders()};
+    authTask = authTask.copyWith(url: uri.toString(), headers: headers);
+  }
+  authTask = authTask ??= task;
+  final modifiedTask =
+      await authTask.options?.onTaskStartCallBack?.call(authTask);
+  return modifiedTask ?? authTask;
 }
 
 // The following functions are related to multipart uploads and are
@@ -392,9 +435,11 @@ Future<String?> responseContent(http.StreamedResponse response) {
   }
 }
 
-/// Returns true if [currentProgress] > [lastProgressUpdate] + threshold and
-/// [now] > [nextProgressUpdateTime]
-bool shouldSendProgressUpdate(double currentProgress, DateTime now) {
-  return currentProgress - lastProgressUpdate > 0.02 &&
-      now.isAfter(nextProgressUpdateTime);
-}
+/// Returns true if [currentProgress] > [lastProgressUpdate] + 2% and
+/// [now] > [nextProgressUpdateTime], or if there was progress and
+/// [now] > [nextProgressUpdateTime] + 2 seconds
+bool shouldSendProgressUpdate(double currentProgress, DateTime now) =>
+    (currentProgress - lastProgressUpdate > 0.02 &&
+        now.isAfter(nextProgressUpdateTime)) ||
+    (currentProgress > lastProgressUpdate &&
+        now.isAfter(nextProgressUpdateTime.add(const Duration(seconds: 2))));

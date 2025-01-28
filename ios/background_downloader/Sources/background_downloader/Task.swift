@@ -33,6 +33,7 @@ struct Task : Codable, Hashable {
     var metaData: String = ""
     var displayName: String = ""
     var creationTime: Int64 = Int64((Date().timeIntervalSince1970 * 1000.0).rounded())
+    var options: TaskOptions?
     var taskType: String
 }
 
@@ -60,6 +61,7 @@ extension Task {
                   metaData: String? = nil,
                   displayName: String? = nil,
                   creationTime: Int64? = nil,
+                  options: TaskOptions? = nil,
                   taskType: String? = nil) -> Task {
         
         var copiedTask = self
@@ -156,6 +158,10 @@ extension Task {
             copiedTask.creationTime = creationTime
         }
         
+        if let options = options {
+            copiedTask.options = options
+        }
+        
         if let taskType = taskType {
             copiedTask.taskType = taskType
         }
@@ -182,6 +188,24 @@ enum Updates: Int {
          statusChange, // only calls upon change in DownloadTaskStatus
          progressUpdates, // only calls for progress
          statusChangeAndProgressUpdates // calls also for progress along the way
+}
+
+/// Holds various options related to the task that are not included in the
+/// task's properties, as they are rare
+struct TaskOptions : Codable, Hashable {
+    var onTaskStartRawHandle: Int64?
+    var onTaskFinishedRawHandle: Int64?
+    var auth: Auth?
+    
+    /// True if [TaskOptions] contains a callback for Start or Auth that happens before the task starts
+    func hasStartCallback() -> Bool {
+        onTaskStartRawHandle != nil
+    }
+    
+    /// True if [TaskOptions] contains a callback that must be called after the task finishes
+    func hasFinishedCallback() -> Bool {
+        onTaskFinishedRawHandle != nil
+    }
 }
 
 /// Defines a set of possible states which a [DownloadTask] can be in.
