@@ -887,7 +887,7 @@ final class UploadTask extends Task {
         super(
             baseDirectory: BaseDirectory.root,
             directory: uri.toString(),
-            filename: uri.pathSegments.last,
+            filename: Uri.parse(url).pathSegments.last,
             httpRequestMethod: httpRequestMethod ?? 'POST',
             post: 'binary',
             allowPause: false) {
